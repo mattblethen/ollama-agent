@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
 Minimal Web UI server for ollama-agent
+
 - Serves UI at /
 - Lists local Ollama models
 - Starts agent runs (subprocess calling agent.py)
 - Streams stdout + events.jsonl lines via SSE
+- NEW: Streams *raw LLM outputs* (planner/coder/verifier) live by watching run_dir text files:
+    1_planner_raw_subX.txt
+    2_coder_raw_subX_iterY.txt
+    4_verifier_raw_subX_iterY.txt
 - Supports Continue using per-root saved config
 
 No external deps. Python 3.9+ recommended.
@@ -14,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import queue
 import re
 import subprocess
@@ -25,6 +29,7 @@ from dataclasses import dataclass, asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
 
 REPO_DIR = Path(__file__).resolve().parent
 UI_DIR = REPO_DIR / "ui"
@@ -97,6 +102,21 @@ def tail_file_lines(path: Path, start_pos: int) -> Tuple[int, list[str]]:
     return new_pos, lines
 
 
+def safe_read_text(path: Path, max_bytes: int = 300_000) -> str:
+    """
+    Read a file safely with a hard cap (prevents a single huge file from clogging SSE).
+    If truncated, appends a notice.
+    """
+    try:
+        b = path.read_bytes()
+        if len(b) <= max_bytes:
+            return b.decode("utf-8", errors="replace")
+        head = b[:max_bytes].decode("utf-8", errors="replace")
+        return head + "\n\n[ui_server] NOTE: output truncated for streaming (file too large)\n"
+    except Exception as e:
+        return f"[ui_server] ERROR reading {path.name}: {e}"
+
+
 @dataclass
 class RunConfig:
     ollama: str
@@ -131,6 +151,9 @@ class RunState:
     _proc: Optional[subprocess.Popen] = None
     _events_pos: int = 0
 
+    # NEW: track raw llm files already streamed
+    _llm_seen: set[str] = None  # type: ignore[assignment]
+
 
 def save_root_state(root: Path, cfg: RunConfig) -> None:
     path = root / STATE_FILE_NAME
@@ -155,14 +178,74 @@ def push(rs: RunState, typ: str, payload: Any) -> None:
     rs.q.put({"t": typ, "d": payload, "ts": now_ms()})
 
 
+# ---------- NEW: raw LLM file detection helpers ----------
+
+RAW_PATTERNS = [
+    # planner
+    (re.compile(r"^1_planner_raw_sub(?P<sub>\d+)\.txt$"), "planner_raw"),
+    # coder
+    (re.compile(r"^2_coder_raw_sub(?P<sub>\d+)_iter(?P<iter>\d+)\.txt$"), "coder_raw"),
+    # verifier
+    (re.compile(r"^4_verifier_raw_sub(?P<sub>\d+)_iter(?P<iter>\d+)\.txt$"), "verifier_raw"),
+]
+
+
+def detect_raw_kind(filename: str) -> Optional[dict]:
+    for rgx, kind in RAW_PATTERNS:
+        m = rgx.match(filename)
+        if not m:
+            continue
+        gd = m.groupdict()
+        sub = int(gd["sub"]) if gd.get("sub") else None
+        it = int(gd["iter"]) if gd.get("iter") else None
+        return {"kind": kind, "sub": sub, "iter": it}
+    return None
+
+
+def stream_new_llm_files(rs: RunState, rd: Path) -> None:
+    """
+    Check run_dir for new raw output files; stream any unseen ones.
+    These files are typically written once (not appended), so we stream full content once.
+    """
+    if rs._llm_seen is None:
+        rs._llm_seen = set()
+
+    try:
+        for p in rd.iterdir():
+            if not p.is_file():
+                continue
+            meta = detect_raw_kind(p.name)
+            if not meta:
+                continue
+            key = p.name
+            if key in rs._llm_seen:
+                continue
+            rs._llm_seen.add(key)
+            text = safe_read_text(p)
+            push(
+                rs,
+                "llm",
+                {
+                    "kind": meta["kind"],
+                    "sub": meta["sub"],
+                    "iter": meta["iter"],
+                    "filename": p.name,
+                    "text": text,
+                },
+            )
+    except Exception as e:
+        push(rs, "error", {"where": "stream_new_llm_files", "error": str(e)})
+
+
+# ---------- agent runner ----------
+
 def run_agent_subprocess(rs: RunState) -> None:
-    """Launch agent.py as a subprocess, stream stdout, and tail events.jsonl."""
+    """Launch agent.py as a subprocess, stream stdout, tail events.jsonl, and stream raw LLM files."""
     root = Path(rs.cfg.root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
     save_root_state(root, rs.cfg)
 
-    # Build command (use only flags your current agent.py supports; unknown flags will error)
     cmd = [
         "python3",
         str(REPO_DIR / "agent.py"),
@@ -184,7 +267,6 @@ def run_agent_subprocess(rs: RunState) -> None:
         str(rs.cfg.timeout),
     ]
 
-    # Optional flags (only include if set and you know your agent supports them)
     if rs.cfg.stall is not None:
         cmd += ["--stall", str(rs.cfg.stall)]
     if rs.cfg.no_llm_verifier:
@@ -205,43 +287,46 @@ def run_agent_subprocess(rs: RunState) -> None:
         universal_newlines=True,
     )
 
-    # Watch for run_dir line, if present
     run_dir_re = re.compile(r"run_dir\s*=\s*(.+)$")
 
-    # Start a side thread to tail events.jsonl (once run_dir exists)
-    def tail_events_loop():
-        last_dir = None
+    def tail_events_and_llm_loop():
+        last_dir: Optional[Path] = None
         while not rs.stop_evt.is_set():
-            # Determine run_dir
-            rd = None
+            rd: Optional[Path] = None
+
             if rs.run_dir:
                 rd = Path(rs.run_dir)
             else:
                 latest = find_latest_run_dir(root)
                 if latest:
                     rd = latest
+
             if rd and rd.exists():
                 if last_dir != rd:
                     last_dir = rd
                     rs.run_dir = str(rd)
                     rs._events_pos = 0
+                    rs._llm_seen = set()
                     push(rs, "run_dir", {"run_dir": rs.run_dir})
 
+                # Stream events.jsonl
                 events_path = rd / "events.jsonl"
                 rs._events_pos, lines = tail_file_lines(events_path, rs._events_pos)
                 for line in lines:
-                    # attempt parse jsonl, otherwise send raw line
                     try:
                         obj = json.loads(line)
                         push(rs, "event", obj)
                     except Exception:
                         push(rs, "event_raw", line)
-            time.sleep(0.25)
 
-    tail_thr = threading.Thread(target=tail_events_loop, daemon=True)
+                # NEW: Stream any raw LLM files that appear
+                stream_new_llm_files(rs, rd)
+
+            time.sleep(0.20)
+
+    tail_thr = threading.Thread(target=tail_events_and_llm_loop, daemon=True)
     tail_thr.start()
 
-    # Stream stdout
     try:
         assert rs._proc.stdout is not None
         for line in rs._proc.stdout:
@@ -250,20 +335,18 @@ def run_agent_subprocess(rs: RunState) -> None:
             line = line.rstrip("\n")
             push(rs, "stdout", line)
 
-            # Try to capture run_dir from stdout
             m = run_dir_re.search(line)
             if m:
                 candidate = m.group(1).strip()
-                # If relative, interpret from root
                 cand_path = Path(candidate)
                 if not cand_path.is_absolute():
                     cand_path = (root / candidate).resolve()
                 rs.run_dir = str(cand_path)
                 push(rs, "run_dir", {"run_dir": rs.run_dir})
+
     except Exception as e:
         push(rs, "error", {"where": "stdout_stream", "error": str(e)})
 
-    # Wait for process end
     rc = None
     try:
         rc = rs._proc.wait(timeout=60 * 60 * 24)
@@ -283,6 +366,7 @@ def run_agent_subprocess(rs: RunState) -> None:
 def start_run(cfg: RunConfig) -> RunState:
     run_id = f"run_{now_ms()}"
     rs = RunState(run_id=run_id, cfg=cfg, started_ms=now_ms())
+    rs._llm_seen = set()
     with RUNS_LOCK:
         RUNS[run_id] = rs
     t = threading.Thread(target=run_agent_subprocess, args=(rs,), daemon=True)
@@ -291,7 +375,7 @@ def start_run(cfg: RunConfig) -> RunState:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ollama-agent-ui/1.0"
+    server_version = "ollama-agent-ui/1.1"
 
     def _send(self, code: int, content_type: str, body: bytes) -> None:
         self.send_response(code)
@@ -314,11 +398,29 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
+        # UI assets
         if self.path == "/" or self.path.startswith("/index.html"):
             p = UI_DIR / "index.html"
             self._send(200, "text/html; charset=utf-8", p.read_bytes())
             return
 
+        if self.path.startswith("/style.css"):
+            p = UI_DIR / "style.css"
+            if p.exists():
+                self._send(200, "text/css; charset=utf-8", p.read_bytes())
+            else:
+                self._send(404, "text/plain; charset=utf-8", b"Missing style.css")
+            return
+
+        if self.path.startswith("/script.js"):
+            p = UI_DIR / "script.js"
+            if p.exists():
+                self._send(200, "text/javascript; charset=utf-8", p.read_bytes())
+            else:
+                self._send(404, "text/plain; charset=utf-8", b"Missing script.js")
+            return
+
+        # APIs
         if self.path.startswith("/api/models"):
             base = self.server.base_ollama  # type: ignore[attr-defined]
             ok, data = list_ollama_models(base)
@@ -326,7 +428,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.startswith("/api/run_status"):
-            # /api/run_status?run_id=...
             run_id = None
             if "?" in self.path:
                 qs = self.path.split("?", 1)[1]
@@ -341,18 +442,20 @@ class Handler(BaseHTTPRequestHandler):
             if not rs:
                 self._send_json(404, {"error": "unknown run_id"})
                 return
-            self._send_json(200, {
-                "run_id": rs.run_id,
-                "started_ms": rs.started_ms,
-                "finished_ms": rs.finished_ms,
-                "exit_code": rs.exit_code,
-                "run_dir": rs.run_dir,
-                "cfg": asdict(rs.cfg),
-            })
+            self._send_json(
+                200,
+                {
+                    "run_id": rs.run_id,
+                    "started_ms": rs.started_ms,
+                    "finished_ms": rs.finished_ms,
+                    "exit_code": rs.exit_code,
+                    "run_dir": rs.run_dir,
+                    "cfg": asdict(rs.cfg),
+                },
+            )
             return
 
         if self.path.startswith("/api/stream"):
-            # SSE: /api/stream?run_id=...
             run_id = None
             if "?" in self.path:
                 qs = self.path.split("?", 1)[1]
@@ -375,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
 
-            # Send initial hello
+            # hello
             self.wfile.write(b"event: hello\n")
             self.wfile.write(f"data: {json.dumps({'run_id': run_id})}\n\n".encode("utf-8"))
             self.wfile.flush()
@@ -388,7 +491,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     if rs.finished_ms is not None:
-                        # allow a brief drain time
                         time.sleep(0.5)
                         break
                     continue
@@ -439,7 +541,6 @@ class Handler(BaseHTTPRequestHandler):
             if not cfg:
                 self._send_json(404, {"error": f"No {STATE_FILE_NAME} found in root"})
                 return
-            # Allow overriding ollama URL from UI if provided
             if body.get("ollama"):
                 cfg.ollama = str(body.get("ollama"))
             rs = start_run(cfg)

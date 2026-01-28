@@ -7,22 +7,50 @@
   <style>
     :root { color-scheme: dark; }
     body {
-      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      background: #0b0f14; color: #e6edf3;
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: #0b0f14;
+      color: #e6edf3;
     }
     header {
-      padding: 12px 16px; border-bottom: 1px solid #233041; background: #0d141c;
-      display: flex; align-items: center; gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid #233041;
+      background: #0d141c;
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
     header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
-    main { display: grid; grid-template-columns: 420px 1fr; height: calc(100vh - 50px); }
-    .panel { padding: 14px 16px; border-right: 1px solid #233041; overflow: auto; }
-    .stream { padding: 14px 16px; overflow: auto; }
+
+    /* 3-panel layout now */
+    main {
+      display: grid;
+      grid-template-columns: 420px 420px 1fr;
+      height: calc(100vh - 50px);
+    }
+
+    .panel {
+      padding: 14px 16px;
+      border-right: 1px solid #233041;
+      overflow: auto;
+    }
+    .planPanel {
+      padding: 14px 16px;
+      border-right: 1px solid #233041;
+      overflow: auto;
+      background: #0c1118;
+    }
+    .stream {
+      padding: 14px 16px;
+      overflow: auto;
+    }
+
     label { display: block; font-size: 12px; opacity: 0.9; margin: 10px 0 6px; }
     input, select, textarea, button {
       width: 100%;
       box-sizing: border-box;
-      background: #111a24; color: #e6edf3;
+      background: #111a24;
+      color: #e6edf3;
       border: 1px solid #243447;
       border-radius: 10px;
       padding: 10px 10px;
@@ -35,7 +63,15 @@
     button { cursor: pointer; font-weight: 600; }
     button:hover { border-color: #3b556f; }
     .small { font-size: 12px; opacity: 0.8; margin-top: 8px; line-height: 1.4; }
-    .badge { font-size: 11px; padding: 2px 8px; border: 1px solid #2a3a4e; border-radius: 999px; opacity: 0.9; }
+
+    .badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border: 1px solid #2a3a4e;
+      border-radius: 999px;
+      opacity: 0.9;
+    }
+
     .log {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
       font-size: 12px;
@@ -46,10 +82,134 @@
     .logline.dim { opacity: 0.75; }
     .logline.err { color: #ff8b8b; }
     .logline.ok  { color: #9ee493; }
+
     .topbar { display:flex; gap:10px; align-items:center; }
     .topbar > * { flex: 0 0 auto; }
     .topbar .spacer { flex: 1 1 auto; }
+
     a { color: #8bd5ff; text-decoration: none; }
+
+    /* Plan UI */
+    .h2 {
+      font-size: 12px;
+      margin: 0 0 10px;
+      font-weight: 700;
+      letter-spacing: 0.25px;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+    .card {
+      border: 1px solid #243447;
+      border-radius: 12px;
+      padding: 10px 10px;
+      background: #0f1621;
+      margin-bottom: 10px;
+    }
+    .muted { opacity: 0.8; }
+    .pill {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 8px;
+      border: 1px solid #2a3a4e;
+      border-radius: 999px;
+      opacity: 0.9;
+      margin-left: 8px;
+    }
+    .checkRow {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 8px 8px;
+      border-radius: 10px;
+      border: 1px solid #1c2a3a;
+      background: #0d141c;
+      margin-bottom: 8px;
+    }
+    .checkRow.done { border-color: #2c4a33; background: #0e1711; }
+    .checkRow input[type="checkbox"] { width: auto; margin-top: 3px; }
+    .stepTitle { font-weight: 700; font-size: 12px; }
+    .stepDetails { font-size: 12px; margin-top: 2px; opacity: 0.85; }
+    .filesLikely { font-size: 11px; margin-top: 6px; opacity: 0.75; }
+
+    /* Stream split */
+    .streamGrid {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 10px;
+      height: 100%;
+    }
+    .splitTwo {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      min-height: 0;
+    }
+    .pane {
+      border: 1px solid #243447;
+      border-radius: 12px;
+      background: #0d141c;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .paneHeader {
+      padding: 8px 10px;
+      border-bottom: 1px solid #243447;
+      font-size: 12px;
+      font-weight: 700;
+      opacity: 0.9;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .paneBody {
+      padding: 0;
+      overflow: auto;
+      min-height: 0;
+    }
+    .paneBodyInner { padding: 8px 10px; }
+
+    .miniBtn {
+      width: auto;
+      padding: 6px 8px;
+      border-radius: 10px;
+      font-size: 12px;
+      background: #111a24;
+      border: 1px solid #243447;
+      color: #e6edf3;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .miniBtn:hover { border-color: #3b556f; }
+
+    .llmBlock {
+      padding: 8px 10px;
+      border-bottom: 1px solid #15202b;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      line-height: 1.35;
+    }
+    .llmHdr {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 6px;
+      opacity: 0.95;
+    }
+    .tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border: 1px solid #2a3a4e;
+      border-radius: 999px;
+      opacity: 0.9;
+      font-weight: 700;
+    }
   </style>
 </head>
 <body>
@@ -57,12 +217,14 @@
   <div class="topbar" style="width:100%">
     <h1>ollama-agent UI</h1>
     <span class="badge" id="status">idle</span>
+    <span class="badge" id="progress">subtask ?/? · iter ?/?</span>
     <div class="spacer"></div>
     <button style="width:auto;padding:8px 10px" id="refreshModels">Refresh models</button>
   </div>
 </header>
 
 <main>
+  <!-- LEFT: Controls -->
   <section class="panel">
     <label>Ollama Base URL</label>
     <input id="ollama" placeholder="http://192.168.5.72:11434" />
@@ -101,7 +263,7 @@
     <div class="btnrow">
       <button id="runBtn">Run</button>
       <button id="continueBtn">Continue</button>
-      <button id="clearBtn">Clear log</button>
+      <button id="clearBtn">Clear stream</button>
     </div>
 
     <div class="small">
@@ -111,9 +273,62 @@
     </div>
   </section>
 
+  <!-- MIDDLE: Plan panel -->
+  <section class="planPanel">
+    <div class="card">
+      <div class="h2">Plan</div>
+      <div class="small muted" id="planMeta">Waiting for plan…</div>
+    </div>
+
+    <div class="card">
+      <div class="h2">Acceptance</div>
+      <div class="small" id="acceptanceList">(none yet)</div>
+    </div>
+
+    <div class="card">
+      <div class="h2">Checklist</div>
+      <div id="planSteps"></div>
+      <div class="small muted" id="planHint" style="margin-top:8px;">
+        Auto-check completes when the run verifies pass. We’ll wire step-by-step auto-checking once the server emits richer progress markers.
+      </div>
+    </div>
+  </section>
+
+  <!-- RIGHT: Stream + LLM Responses -->
   <section class="stream">
-    <div class="small" id="runMeta">No run yet.</div>
-    <div class="log" id="log"></div>
+    <div class="streamGrid">
+      <div class="small" id="runMeta">No run yet.</div>
+
+      <div class="splitTwo">
+        <div class="pane">
+          <div class="paneHeader">
+            <span>Live Stream (stdout + events)</span>
+            <button class="miniBtn" id="copyStream">Copy</button>
+          </div>
+          <div class="paneBody">
+            <div class="log" id="log"></div>
+          </div>
+        </div>
+
+        <div class="pane">
+          <div class="paneHeader">
+            <span>LLM Responses (planner/coder/verifier)</span>
+            <button class="miniBtn" id="clearLLM">Clear</button>
+          </div>
+          <div class="paneBody" id="llmFeed">
+            <div class="paneBodyInner small muted" id="llmHint">
+              Waiting for server to stream raw model outputs. Next step is updating <code>ui_server.py</code> to emit planner/coder/verifier responses as they’re written in the run_dir.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="small muted">
+          Tip: once server support is added, you’ll see every raw model response here, plus the plan auto-check will update step-by-step.
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -121,6 +336,12 @@
   const $ = (id) => document.getElementById(id);
 
   function setStatus(s) { $("status").textContent = s; }
+  function setProgress(subCur=null, subTot=null, itCur=null, itTot=null) {
+    const a = (subCur && subTot) ? `subtask ${subCur}/${subTot}` : "subtask ?/?";
+    const b = (itCur && itTot) ? `iter ${itCur}/${itTot}` : "iter ?/?";
+    $("progress").textContent = `${a} · ${b}`;
+  }
+
   function logLine(text, cls="") {
     const el = document.createElement("div");
     el.className = "logline " + cls;
@@ -130,7 +351,142 @@
     $("log").parentElement.scrollTop = $("log").parentElement.scrollHeight;
   }
 
-  function clearLog() { $("log").innerHTML = ""; }
+  function clearStream() { $("log").innerHTML = ""; }
+  function clearLLM() {
+    $("llmFeed").innerHTML = "";
+    const hint = document.createElement("div");
+    hint.className = "paneBodyInner small muted";
+    hint.id = "llmHint";
+    hint.textContent = "Waiting for server to stream raw model outputs. Next step is updating ui_server.py to emit planner/coder/verifier responses as they’re written in the run_dir.";
+    $("llmFeed").appendChild(hint);
+  }
+
+  function copyStreamToClipboard() {
+    const lines = Array.from($("log").querySelectorAll(".logline")).map(x => x.textContent);
+    const txt = lines.join("\n");
+    navigator.clipboard.writeText(txt).then(() => {
+      logLine("[ui] Copied stream to clipboard", "ok");
+    }).catch(() => {
+      logLine("[ui] Failed to copy stream", "err");
+    });
+  }
+
+  // PLAN rendering
+  let currentPlan = null; // {acceptance:[], plan:[]}
+  function renderAcceptance(acc) {
+    if (!acc || !acc.length) {
+      $("acceptanceList").textContent = "(none)";
+      return;
+    }
+    $("acceptanceList").innerHTML = acc.map(a => `<div>• ${escapeHtml(a)}</div>`).join("");
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function renderPlanSteps(planArr) {
+    const host = $("planSteps");
+    host.innerHTML = "";
+    if (!planArr || !planArr.length) {
+      host.innerHTML = `<div class="small muted">(no steps yet)</div>`;
+      return;
+    }
+
+    for (let i = 0; i < planArr.length; i++) {
+      const step = planArr[i] || {};
+      const stepNum = (step.step != null) ? step.step : (i + 1);
+      const title = step.title || `Step ${stepNum}`;
+      const details = step.details || "";
+      const files = Array.isArray(step.files_likely) ? step.files_likely : [];
+
+      const row = document.createElement("div");
+      row.className = "checkRow";
+      row.dataset.step = String(stepNum);
+
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.addEventListener("change", () => {
+        row.classList.toggle("done", cb.checked);
+      });
+
+      const body = document.createElement("div");
+      body.style.flex = "1 1 auto";
+
+      const t = document.createElement("div");
+      t.className = "stepTitle";
+      t.textContent = `Step ${stepNum}: ${title}`;
+
+      const d = document.createElement("div");
+      d.className = "stepDetails";
+      d.textContent = details;
+
+      const f = document.createElement("div");
+      f.className = "filesLikely";
+      f.textContent = files.length ? `files likely: ${files.join(", ")}` : "";
+
+      body.appendChild(t);
+      if (details) body.appendChild(d);
+      if (files.length) body.appendChild(f);
+
+      row.appendChild(cb);
+      row.appendChild(body);
+      host.appendChild(row);
+    }
+  }
+
+  function checkAllPlanSteps() {
+    const rows = Array.from(document.querySelectorAll(".checkRow"));
+    for (const r of rows) {
+      const cb = r.querySelector('input[type="checkbox"]');
+      if (cb) {
+        cb.checked = true;
+        r.classList.add("done");
+      }
+    }
+  }
+
+  // LLM feed blocks (server will emit these later)
+  function appendLLM(kind, payload) {
+    // payload could be {model, sub, iter, text} or similar
+    const wrap = document.createElement("div");
+    wrap.className = "llmBlock";
+
+    const hdr = document.createElement("div");
+    hdr.className = "llmHdr";
+
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = kind;
+
+    const meta = document.createElement("span");
+    const sub = payload?.sub != null ? `sub ${payload.sub}` : "";
+    const iter = payload?.iter != null ? `iter ${payload.iter}` : "";
+    const model = payload?.model ? payload.model : "";
+    const parts = [model, sub, iter].filter(Boolean);
+    meta.textContent = parts.join(" · ");
+
+    hdr.appendChild(tag);
+    if (parts.length) hdr.appendChild(meta);
+
+    const body = document.createElement("div");
+    body.textContent = payload?.text || payload?.raw || JSON.stringify(payload);
+
+    wrap.appendChild(hdr);
+    wrap.appendChild(body);
+
+    // remove hint if present
+    const hint = $("llmHint");
+    if (hint) hint.remove();
+
+    $("llmFeed").appendChild(wrap);
+    $("llmFeed").scrollTop = $("llmFeed").scrollHeight;
+  }
 
   async function getModels() {
     const res = await fetch("/api/models");
@@ -142,7 +498,6 @@
   function fillSelect(sel, models, preferred=[]) {
     sel.innerHTML = "";
     const uniq = Array.from(new Set(models));
-    // Put preferred first if present
     const ordered = [];
     for (const p of preferred) if (uniq.includes(p)) ordered.push(p);
     for (const m of uniq) if (!ordered.includes(m)) ordered.push(m);
@@ -190,22 +545,27 @@
       body: JSON.stringify(obj),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data.error || `HTTP ${res.status}`);
-    }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     return data;
+  }
+
+  function resetPlanUI() {
+    currentPlan = null;
+    $("planMeta").textContent = "Waiting for plan…";
+    $("acceptanceList").textContent = "(none yet)";
+    $("planSteps").innerHTML = `<div class="small muted">(no steps yet)</div>`;
+    setProgress(null, null, null, null);
   }
 
   function streamRun(runId) {
     setStatus("running");
     $("runMeta").textContent = `Run ID: ${runId}`;
     logLine(`--- streaming ${runId} ---`, "dim");
+    resetPlanUI();
 
     const es = new EventSource(`/api/stream?run_id=${encodeURIComponent(runId)}`);
 
-    es.addEventListener("hello", (ev) => {
-      // ignore
-    });
+    es.addEventListener("hello", () => {});
 
     es.addEventListener("msg", (ev) => {
       const msg = JSON.parse(ev.data);
@@ -221,14 +581,41 @@
         logLine(`[run_dir] ${d.run_dir}`, "dim");
         $("runMeta").innerHTML = `Run ID: <b>${runId}</b> &nbsp; | &nbsp; Run dir: <code>${d.run_dir}</code>`;
       } else if (t === "event") {
-        // compact event rendering
         const typ = d.type || "event";
-        if (typ === "summary") {
+
+        // Plan comes through here (events.jsonl)
+        if (typ === "plan") {
+          const plan = Array.isArray(d.plan) ? d.plan : [];
+          const acc = Array.isArray(d.acceptance) ? d.acceptance : [];
+          currentPlan = { plan, acceptance: acc };
+          $("planMeta").innerHTML = `<span class="muted">Loaded plan from event stream</span><span class="pill">sub ${d.sub ?? "?"}</span>`;
+          renderAcceptance(acc);
+          renderPlanSteps(plan);
+          logLine(`[event] plan (${plan.length} step(s))`, "dim");
+        } else if (typ === "iter_start") {
+          // We don’t know total subtasks from events alone; show what we can.
+          const it = d.iter ?? null;
+          const sub = d.sub ?? null;
+          setProgress(sub, "?", it, $("maxIters").value || "?");
+          logLine(`[event] iter_start (sub=${sub}, iter=${it})`, "dim");
+        } else if (typ === "summary") {
           const ok = d.verified_pass === true;
           logLine(`[summary] verified_pass=${ok}`, ok ? "ok" : "err");
+          if (ok) checkAllPlanSteps();
+        } else if (typ === "verify_llm") {
+          const ok = !!d.pass;
+          logLine(`[event] verify_llm pass=${ok}`, ok ? "ok" : "err");
+        } else if (typ === "verify_local") {
+          const ok = !!d.pass;
+          const name = d.name || "local";
+          logLine(`[event] verify_local(${name}) pass=${ok}`, ok ? "ok" : "err");
         } else {
           logLine(`[event] ${typ}`, "dim");
         }
+      } else if (t === "llm") {
+        // NEXT SERVER UPDATE will emit this:
+        // { kind: "planner_raw"|"coder_raw"|"verifier_raw", model, sub, iter, text }
+        appendLLM(d.kind || "llm", d);
       } else if (t === "event_raw") {
         logLine(`[event_raw] ${d}`, "dim");
       } else if (t === "error") {
@@ -250,7 +637,8 @@
   }
 
   $("runBtn").addEventListener("click", async () => {
-    clearLog();
+    clearStream();
+    clearLLM();
     const cfg = readForm();
     try {
       const out = await postJson("/api/run", cfg);
@@ -277,12 +665,19 @@
     }
   });
 
-  $("clearBtn").addEventListener("click", clearLog);
+  $("clearBtn").addEventListener("click", () => {
+    clearStream();
+    clearLLM();
+    resetPlanUI();
+  });
+
   $("refreshModels").addEventListener("click", refreshModels);
+  $("copyStream").addEventListener("click", copyStreamToClipboard);
+  $("clearLLM").addEventListener("click", clearLLM);
 
   // sensible defaults
   $("ollama").value = "http://192.168.5.72:11434";
-
+  setProgress(null, null, null, null);
   refreshModels();
 </script>
 </body>

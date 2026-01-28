@@ -2,7 +2,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent_ollama import ollama_chat, ollama_tags
 from agent_tools import (
@@ -71,7 +71,7 @@ def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                chunk = text[start:i+1]
+                chunk = text[start : i + 1]
                 try:
                     obj = json.loads(chunk)
                     return obj if isinstance(obj, dict) else None
@@ -82,77 +82,101 @@ def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
 def _planner_prompt(task: str) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": "You are a planning assistant. Output ONLY JSON."},
-        {"role": "user", "content":
-            "Create a short executable plan as JSON.\n\n"
-            "Return JSON like:\n"
-            "{\n"
-            '  "acceptance": ["..."],\n'
-            '  "plan": [{"step": 1, "title": "...", "details": "...", "files_likely": ["..."]}]\n'
-            "}\n\n"
-            f"TASK:\n{task}\n"
-        }
+        {
+            "role": "user",
+            "content": (
+                "Create a short executable plan as JSON.\n\n"
+                "Return JSON like:\n"
+                "{\n"
+                '  "acceptance": ["..."],\n'
+                '  "plan": [{"step": 1, "title": "...", "details": "...", "files_likely": ["..."]}]\n'
+                "}\n\n"
+                f"TASK:\n{task}\n"
+            ),
+        },
     ]
 
 def _coder_prompt(task: str, plan_json: Dict[str, Any], tree: List[str], focus: str) -> List[Dict[str, str]]:
     tree_text = "\n".join(tree[:300])
     return [
-        {"role": "system", "content":
-            "You are a coding agent. You MUST respond with ONLY JSON.\n"
-            "Your JSON must have this shape:\n"
-            "{\n"
-            '  "writes": [{"path":"relative/path.ext","content":"..."}],\n'
-            '  "notes": ["..."]\n'
-            "}\n"
-            "Rules:\n"
-            "- Always include FULL FILE CONTENT in each write.\n"
-            "- Paths must be relative. Do NOT write outside root.\n"
-            "- If fixing something, rewrite the whole file(s).\n"
+        {
+            "role": "system",
+            "content": (
+                "You are a coding agent. You MUST respond with ONLY JSON.\n"
+                "Your JSON must have this shape:\n"
+                "{\n"
+                '  "writes": [{"path":"relative/path.ext","content":"..."}],\n'
+                '  "notes": ["..."]\n'
+                "}\n"
+                "Rules:\n"
+                "- Always include FULL FILE CONTENT in each write.\n"
+                "- Paths must be relative. Do NOT write outside root.\n"
+                "- If fixing something, rewrite the whole file(s).\n"
+            ),
         },
-        {"role": "user", "content":
-            f"TASK:\n{task}\n\n"
-            f"PLAN_JSON:\n{json.dumps(plan_json, ensure_ascii=False)}\n\n"
-            f"CURRENT_FILES:\n{tree_text}\n\n"
-            f"FOCUS:\n{focus}\n\n"
-            "Return only the JSON object."
-        }
+        {
+            "role": "user",
+            "content": (
+                f"TASK:\n{task}\n\n"
+                f"PLAN_JSON:\n{json.dumps(plan_json, ensure_ascii=False)}\n\n"
+                f"CURRENT_FILES:\n{tree_text}\n\n"
+                f"FOCUS:\n{focus}\n\n"
+                "Return only the JSON object."
+            ),
+        },
     ]
 
 def _llm_verify_prompt(task: str, acceptance: List[str], tree: List[str], snippets: Dict[str, str]) -> List[Dict[str, str]]:
     acceptance_text = "\n".join(f"- {a}" for a in (acceptance or [])) or "(none provided)"
     return [
-        {"role": "system", "content":
-            "You are a strict verifier. Decide pass/fail based on the acceptance criteria. Output ONLY JSON.\n"
-            "Format:\n"
-            "{\n"
-            '  \"pass\": true/false,\n'
-            '  \"issues\": [\"...\"],\n'
-            '  \"suggestions\": [\"...\"],\n'
-            '  \"notes\": \"optional\"\n'
-            "}\n"
-            "Rules:\n"
-            "- Be specific and actionable.\n"
-            "- If something is missing, say exactly what file/element/function is missing.\n"
-            "- Do NOT invent files that do not exist.\n"
+        {
+            "role": "system",
+            "content": (
+                "You are a strict verifier. Decide pass/fail based on the acceptance criteria. Output ONLY JSON.\n"
+                "Format:\n"
+                "{\n"
+                '  "pass": true/false,\n'
+                '  "issues": ["..."],\n'
+                '  "suggestions": ["..."],\n'
+                '  "notes": "optional"\n'
+                "}\n"
+                "Rules:\n"
+                "- Be specific and actionable.\n"
+                "- If something is missing, say exactly what file/element/function is missing.\n"
+                "- Do NOT invent files that do not exist.\n"
+            ),
         },
-        {"role": "user", "content":
-            f"TASK:\n{task}\n\n"
-            f"ACCEPTANCE_CRITERIA:\n{acceptance_text}\n\n"
-            f"FILES:\n" + "\n".join(tree[:350]) + "\n\n"
-            "SNIPPETS:\n" + json.dumps(snippets, ensure_ascii=False) + "\n"
-        }
+        {
+            "role": "user",
+            "content": (
+                f"TASK:\n{task}\n\n"
+                f"ACCEPTANCE_CRITERIA:\n{acceptance_text}\n\n"
+                f"FILES:\n" + "\n".join(tree[:350]) + "\n\n"
+                "SNIPPETS:\n" + json.dumps(snippets, ensure_ascii=False) + "\n"
+            ),
+        },
     ]
 
 def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
     msgs = [
         {"role": "system", "content": "You split tasks into smaller steps. Output ONLY JSON."},
-        {"role": "user", "content":
-            "Split the following task into 2-6 sequential subtasks that can be executed one-by-one.\n"
-            "Return JSON: {\"subtasks\": [\"...\", \"...\"]}\n\n"
-            f"TASK:\n{task}\n"
-        }
+        {
+            "role": "user",
+            "content": (
+                "Split the following task into 2-6 sequential subtasks that can be executed one-by-one.\n"
+                'Return JSON: {"subtasks": ["...", "..."]}\n\n'
+                f"TASK:\n{task}\n"
+            ),
+        },
     ]
-    raw = ollama_chat(cfg.base_url, cfg.planner_model, msgs, temperature=0.2,
-                      timeout_s=min(cfg.timeout_s, 240), retries=cfg.retries)
+    raw = ollama_chat(
+        cfg.base_url,
+        cfg.planner_model,
+        msgs,
+        temperature=0.2,
+        timeout_s=min(cfg.timeout_s, 240),
+        retries=cfg.retries,
+    )
     _save_text(run_dir, "task_chunker_raw.txt", raw)
     obj = _extract_json_obj(raw) or {}
     subs = obj.get("subtasks") if isinstance(obj.get("subtasks"), list) else None
@@ -166,9 +190,67 @@ def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
         if not s:
             continue
         if len(s) > cfg.chunk_max_chars:
-            s = s[:cfg.chunk_max_chars] + " (truncated)"
+            s = s[: cfg.chunk_max_chars] + " (truncated)"
         cleaned.append(s)
-    return cleaned[:6] if cleaned else [task[:cfg.chunk_max_chars]]
+    return cleaned[:6] if cleaned else [task[: cfg.chunk_max_chars]]
+
+# -------- NEW: plan-step event helpers --------
+
+def _safe_plan_steps(plan_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    p = plan_json.get("plan", [])
+    if not isinstance(p, list):
+        return []
+    out = []
+    for s in p:
+        if isinstance(s, dict):
+            out.append(s)
+    return out
+
+def _step_meta(plan_steps: List[Dict[str, Any]], step_num: int) -> Dict[str, Any]:
+    """
+    Best-effort lookup of title/details from plan.
+    step_num is 1-based.
+    """
+    if step_num <= 0:
+        step_num = 1
+
+    # Try: match dict["step"] first
+    for s in plan_steps:
+        try:
+            if int(s.get("step", -1)) == step_num:
+                return {
+                    "title": s.get("title"),
+                    "details": s.get("details"),
+                    "files_likely": s.get("files_likely"),
+                }
+        except Exception:
+            continue
+
+    # Fallback: index-based
+    idx = step_num - 1
+    if 0 <= idx < len(plan_steps):
+        s = plan_steps[idx]
+        return {
+            "title": s.get("title"),
+            "details": s.get("details"),
+            "files_likely": s.get("files_likely"),
+        }
+
+    return {"title": None, "details": None, "files_likely": None}
+
+def _map_iter_to_step(plan_steps: List[Dict[str, Any]], it: int) -> int:
+    """
+    Simple, stable mapping:
+    - if plan has N steps, iteration 1..N maps to step 1..N
+    - iterations beyond N cap at step N (so we don’t exceed UI checklist bounds)
+    - if plan is empty, map step_num = it (still emits granular progress)
+    """
+    if it <= 0:
+        it = 1
+    n = len(plan_steps)
+    if n <= 0:
+        return it
+    return min(it, n)
 
 def run_agent(
     root: str,
@@ -216,6 +298,8 @@ def run_agent(
 
     _log_event(run_dir, {"type": "start", "root": str(cfg.root), "task": cfg.task, "ollama_base_url": cfg.base_url})
     _log_event(run_dir, {"type": "models", "planner": cfg.planner_model, "coder": cfg.coder_model, "verifier": cfg.verifier_model})
+    if cfg.run_seed:
+        _log_event(run_dir, {"type": "run_seed", "seed": cfg.run_seed})
 
     # quick connectivity sanity
     try:
@@ -234,18 +318,63 @@ def run_agent(
         focus_prefix = f"[subtask {sub_i}/{len(effective_tasks)}] "
 
         print(f"[agent] planner... {focus_prefix}")
-        plan_raw = ollama_chat(cfg.base_url, cfg.planner_model, _planner_prompt(subtask),
-                               temperature=0.2, timeout_s=cfg.timeout_s, retries=cfg.retries)
+        plan_raw = ollama_chat(
+            cfg.base_url,
+            cfg.planner_model,
+            _planner_prompt(subtask),
+            temperature=0.2,
+            timeout_s=cfg.timeout_s,
+            retries=cfg.retries,
+        )
         _save_text(run_dir, f"1_planner_raw_sub{sub_i}.txt", plan_raw)
 
         plan_json = _extract_json_obj(plan_raw) or {"acceptance": [], "plan": []}
-        (run_dir / f"1_plan_sub{sub_i}.json").write_text(json.dumps(plan_json, indent=2, ensure_ascii=False), encoding="utf-8")
-        _log_event(run_dir, {"type": "plan", "sub": sub_i, "plan": plan_json.get("plan", []), "acceptance": plan_json.get("acceptance", [])})
+        (run_dir / f"1_plan_sub{sub_i}.json").write_text(
+            json.dumps(plan_json, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _log_event(
+            run_dir,
+            {
+                "type": "plan",
+                "sub": sub_i,
+                "plan": plan_json.get("plan", []),
+                "acceptance": plan_json.get("acceptance", []),
+            },
+        )
+
+        # NEW: cache plan steps for step-level progress events
+        plan_steps = _safe_plan_steps(plan_json)
+        _log_event(
+            run_dir,
+            {
+                "type": "plan_steps_meta",
+                "sub": sub_i,
+                "count": len(plan_steps),
+            },
+        )
 
         last_progress = _now()
         last_verifier_report: Dict[str, Any] = {}
+        completed_steps: set[int] = set()
 
         for it in range(1, cfg.max_iters + 1):
+            # NEW: plan-step start event
+            step_num = _map_iter_to_step(plan_steps, it)
+            meta = _step_meta(plan_steps, step_num)
+            _log_event(
+                run_dir,
+                {
+                    "type": "plan_step_start",
+                    "sub": sub_i,
+                    "iter": it,
+                    "step": step_num,
+                    "title": meta.get("title"),
+                    "details": meta.get("details"),
+                    "files_likely": meta.get("files_likely"),
+                },
+            )
+
             _log_event(run_dir, {"type": "iter_start", "iter": it, "sub": sub_i})
             print(f"[agent] Iteration {it}/{cfg.max_iters} {focus_prefix}")
 
@@ -310,6 +439,41 @@ def run_agent(
                 _log_event(run_dir, {"type": "verify_llm", "iter": it, "sub": sub_i, "pass": ok_llm, "issues": llm_issues, "suggestions": llm_suggestions})
 
             if ok_inv and plugin_pass and (ok_llm if cfg.llm_verifier else True):
+                # NEW: if we pass, mark ALL remaining steps as done (so checklist finishes cleanly)
+                nsteps = len(plan_steps)
+                if nsteps > 0:
+                    for s in range(1, nsteps + 1):
+                        if s in completed_steps:
+                            continue
+                        m = _step_meta(plan_steps, s)
+                        _log_event(
+                            run_dir,
+                            {
+                                "type": "plan_step_done",
+                                "sub": sub_i,
+                                "iter": it,
+                                "step": s,
+                                "title": m.get("title"),
+                                "reason": "verified_pass",
+                            },
+                        )
+                        completed_steps.add(s)
+                else:
+                    # No plan steps; still close out the current step
+                    if step_num not in completed_steps:
+                        _log_event(
+                            run_dir,
+                            {
+                                "type": "plan_step_done",
+                                "sub": sub_i,
+                                "iter": it,
+                                "step": step_num,
+                                "title": meta.get("title"),
+                                "reason": "verified_pass",
+                            },
+                        )
+                        completed_steps.add(step_num)
+
                 _log_event(
                     run_dir,
                     {
@@ -350,8 +514,14 @@ def run_agent(
             msgs = _coder_prompt(subtask, plan_json, tree, focus)
 
             _log_event(run_dir, {"type": "note", "where": "coder_request", "iter": it, "sub": sub_i, "model": cfg.coder_model, "timeout_s": cfg.timeout_s})
-            coder_raw = ollama_chat(cfg.base_url, cfg.coder_model, msgs,
-                                    temperature=0.2, timeout_s=cfg.timeout_s, retries=cfg.retries)
+            coder_raw = ollama_chat(
+                cfg.base_url,
+                cfg.coder_model,
+                msgs,
+                temperature=0.2,
+                timeout_s=cfg.timeout_s,
+                retries=cfg.retries,
+            )
             _save_text(run_dir, f"2_coder_raw_sub{sub_i}_iter{it}.txt", coder_raw)
             _log_event(run_dir, {"type": "note", "where": "coder_response", "iter": it, "sub": sub_i})
 
@@ -368,6 +538,21 @@ def run_agent(
                         "msg": "Coder returned zero writes. Next iteration should explicitly write required files.",
                     },
                 )
+                # NEW: mark step skipped (keeps checklist honest + visible)
+                if step_num not in completed_steps:
+                    _log_event(
+                        run_dir,
+                        {
+                            "type": "plan_step_skip",
+                            "sub": sub_i,
+                            "iter": it,
+                            "step": step_num,
+                            "title": meta.get("title"),
+                            "reason": "coder_no_writes",
+                        },
+                    )
+                # no changes => do not bump last_progress
+                continue
 
             changes = []
             for w in writes:
@@ -380,10 +565,28 @@ def run_agent(
                 changes.append(write_file(cfg.root, path, content))
 
             _log_event(run_dir, {"type": "tool_results", "iter": it, "sub": sub_i, "changes": changes})
-            (run_dir / f"3_tool_results_sub{sub_i}_iter{it}.json").write_text(json.dumps({"changes": changes}, indent=2, ensure_ascii=False), encoding="utf-8")
+            (run_dir / f"3_tool_results_sub{sub_i}_iter{it}.json").write_text(
+                json.dumps({"changes": changes}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
             if changes:
                 last_progress = _now()
+                # NEW: mark current step done after successful writes
+                if step_num not in completed_steps:
+                    _log_event(
+                        run_dir,
+                        {
+                            "type": "plan_step_done",
+                            "sub": sub_i,
+                            "iter": it,
+                            "step": step_num,
+                            "title": meta.get("title"),
+                            "reason": "writes_applied",
+                            "writes": len(changes),
+                        },
+                    )
+                    completed_steps.add(step_num)
 
         else:
             _log_event(
