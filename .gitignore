@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs + outputs (very important)
+.agent_logs/
+**/.agent_logs/
+*.log
+*.jsonl
+
+# Local env secrets
+.env

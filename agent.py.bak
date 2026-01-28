@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+from pathlib import Path
+
+from agent_core import run_agent
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Local Ollama Dev Agent")
+    p.add_argument("--root", required=True, help="Project root folder")
+    p.add_argument("--task", required=True, help="Task text")
+    p.add_argument("--ollama", default=None, help="Ollama base URL (e.g. http://127.0.0.1:11434)")
+    p.add_argument("--planner-model", default="qwen3:30b")
+    p.add_argument("--coder-model", default="qwen3-coder:30b")
+    p.add_argument("--verifier-model", default="qwen3:30b")
+    p.add_argument("--max-iters", type=int, default=12)
+    p.add_argument("--timeout-s", type=int, default=180, help="Per-call timeout seconds")
+    args = p.parse_args()
+
+    return run_agent(
+        root=Path(args.root).expanduser().resolve(),
+        task=args.task,
+        ollama_base_url=args.ollama,
+        planner_model=args.planner_model,
+        coder_model=args.coder_model,
+        verifier_model=args.verifier_model,
+        max_iters=args.max_iters,
+        timeout_s=args.timeout_s,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,282 @@
+from __future__ import annotations
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+
+from agent_ollama import ollama_chat
+from agent_tools import build_verifier_context, sanity_signals, EXCLUDE_DIRS
+
+
+def _now_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _append_event(run_dir: Path, event: dict) -> None:
+    event = dict(event)
+    event["ts"] = time.time()
+    (run_dir / "events.jsonl").parent.mkdir(parents=True, exist_ok=True)
+    with (run_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _normalize_verifier(obj: dict) -> dict:
+    """
+    Accept either {pass, issues[]} or {pass, reasons[]}.
+    Always return: {pass: bool, issues: list[str], suggestions: list[str], next_action_hint: str|None, notes: str|None}
+    """
+    issues = obj.get("issues")
+    reasons = obj.get("reasons")
+    if isinstance(issues, list):
+        norm_issues = [str(x) for x in issues]
+    elif isinstance(reasons, list):
+        norm_issues = [str(x) for x in reasons]
+    else:
+        norm_issues = []
+
+    suggestions = obj.get("suggestions")
+    norm_sugg = [str(x) for x in suggestions] if isinstance(suggestions, list) else []
+
+    return {
+        "pass": bool(obj.get("pass")),
+        "issues": norm_issues,
+        "suggestions": norm_sugg,
+        "next_action_hint": obj.get("next_action_hint"),
+        "notes": obj.get("notes"),
+        "raw": obj,
+    }
+
+
+def _planner_prompt(task: str) -> list[dict]:
+    return [
+        {"role": "system", "content": "You are a careful software planner. Return STRICT JSON only."},
+        {"role": "user", "content": f"""Create a short plan for this task and acceptance criteria.
+
+Return JSON:
+{{
+  "plan":[{{"step":1,"title":"...","details":"...","files_likely":["..."]}}],
+  "acceptance":["..."]
+}}
+
+TASK:
+{task}
+"""},
+    ]
+
+
+def _coder_prompt(task: str, plan_json: dict, verifier_issues: list[str] | None) -> list[dict]:
+    issues_text = ""
+    if verifier_issues:
+        issues_text = "\n\nVERIFIER ISSUES TO FIX (do NOT regress other requirements):\n- " + "\n- ".join(verifier_issues)
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You write minimal, correct code changes.\n"
+                "RULES:\n"
+                "- Only edit files in the project root.\n"
+                "- Do NOT rename titles/buttons unless explicitly required.\n"
+                "- Do NOT delete working features when fixing a bug.\n"
+                "- Preserve requirements. Avoid regressions.\n"
+                "- If grid colors are required, ensure CSS classes match JS classes.\n"
+                "Return STRICT JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"""Implement the task in the project root.
+
+You may create or edit: index.html, style.css, script.js.
+
+TASK:
+{task}
+
+PLAN (for reference):
+{json.dumps(plan_json, ensure_ascii=False, indent=2)}
+
+{issues_text}
+
+Return JSON:
+{{
+  "writes":[{{"path":"index.html","content":"..."}}, ...],
+  "notes":"short note"
+}}
+""",
+        },
+    ]
+
+
+def _verifier_prompt(task: str, acceptance: list[str], context_blob: str) -> list[dict]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a strict acceptance verifier.\n"
+                "You MUST judge based ONLY on the provided repo snapshot + file contents.\n"
+                "Return STRICT JSON ONLY.\n\n"
+                "Output schema:\n"
+                "{\n"
+                '  "pass": true|false,\n'
+                '  "issues": ["..."],\n'
+                '  "suggestions": ["..."],\n'
+                '  "next_action_hint": "..." | null,\n'
+                '  "notes": "..." | null\n'
+                "}\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"""Verify the project meets requirements.
+
+TASK:
+{task}
+
+ACCEPTANCE:
+{json.dumps(acceptance, ensure_ascii=False, indent=2)}
+
+REPO_STATE:
+{context_blob}
+""",
+        },
+    ]
+
+
+def _apply_writes(root: Path, writes: list[dict], run_dir: Path, iter_n: int) -> list[dict]:
+    changes = []
+    for w in writes:
+        rel = w.get("path")
+        content = w.get("content")
+        if not isinstance(rel, str) or not isinstance(content, str):
+            continue
+        # protect: keep inside root
+        p = (root / rel).resolve()
+        if root not in p.parents and p != root:
+            continue
+        existed = p.exists()
+        old = p.read_bytes() if existed else b""
+        new = content.encode("utf-8")
+        if existed and old == new:
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(new)
+        changes.append({"op": "write_file", "path": rel, "existed": existed})
+    _append_event(run_dir, {"type": "tool_results", "iter": iter_n, "changes": changes})
+    return changes
+
+
+def run_agent(
+    root: Path,
+    task: str,
+    ollama_base_url: str | None,
+    planner_model: str,
+    coder_model: str,
+    verifier_model: str,
+    max_iters: int,
+    timeout_s: int,
+) -> int:
+    root.mkdir(parents=True, exist_ok=True)
+    base_url = ollama_base_url or "http://127.0.0.1:11434"
+
+    run_dir = root / ".agent_logs" / _now_run_id()
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[agent] run_dir = {run_dir}")
+    print(f"[agent] root    = {root}")
+    print(f"[agent] ollama  = {base_url}")
+    print(f"[agent] models: planner={planner_model} coder={coder_model} verifier={verifier_model}")
+
+    _append_event(run_dir, {"type": "start", "root": str(root), "task": task, "ollama_base_url": base_url})
+    _append_event(run_dir, {"type": "models", "planner": planner_model, "coder": coder_model, "verifier": verifier_model})
+
+    # 1) Plan
+    print("[agent] planner...")
+    plan_raw = ollama_chat(base_url, planner_model, _planner_prompt(task), temperature=0.2, timeout_s=timeout_s, retries=2)
+    _write_text(run_dir / "1_planner_raw.txt", plan_raw)
+
+    try:
+        plan_json = json.loads(plan_raw)
+    except Exception:
+        plan_json = {"plan": [], "acceptance": []}
+
+    acceptance = plan_json.get("acceptance") if isinstance(plan_json.get("acceptance"), list) else []
+    _write_text(run_dir / "1_plan.json", json.dumps(plan_json, ensure_ascii=False, indent=2))
+
+    last_verifier = None
+
+    # loop
+    for iter_n in range(1, max_iters + 1):
+        print(f"[agent] Iteration {iter_n}/{max_iters}")
+        _append_event(run_dir, {"type": "iter_start", "iter": iter_n})
+
+        # 2) Coder
+        verifier_issues = last_verifier["issues"] if last_verifier and last_verifier.get("issues") else None
+        coder_raw = ollama_chat(base_url, coder_model, _coder_prompt(task, plan_json, verifier_issues), temperature=0.1, timeout_s=timeout_s, retries=2)
+        _write_text(run_dir / f"2_coder_raw_iter{iter_n}.txt", coder_raw)
+
+        try:
+            coder_json = json.loads(coder_raw)
+        except Exception:
+            coder_json = {"writes": [], "notes": "invalid coder json"}
+
+        writes = coder_json.get("writes") if isinstance(coder_json.get("writes"), list) else []
+        _apply_writes(root, writes, run_dir, iter_n)
+
+        # 3) Verifier (IMPORTANT: snapshot + contents every time)
+        print("[agent] verifier...")
+        context_blob = build_verifier_context(root)
+
+        verifier_raw = ""
+        try:
+            verifier_raw = ollama_chat(
+                base_url,
+                verifier_model,
+                _verifier_prompt(task, acceptance, context_blob),
+                temperature=0.0,
+                timeout_s=timeout_s,
+                retries=2,
+            )
+        except Exception as e:
+            # if verifier fails, fall back to local heuristic: do not spiral forever
+            sig = sanity_signals(root)
+            _append_event(run_dir, {"type": "verifier_error", "iter": iter_n, "error": str(e), "local_signals": sig})
+            # If local signals look good, stop with "unverified" rather than looping.
+            ok = sig["exists"].get("index.html") and sig["exists"].get("style.css") and sig["exists"].get("script.js")
+            if ok:
+                _append_event(run_dir, {"type": "summary", "verified_pass": None, "unverified": True, "verifier_report": None})
+                print("[agent] done. verified_pass=None unverified=True (verifier unreachable)")
+                return 0
+            continue
+
+        _write_text(run_dir / f"4_verifier_raw_iter{iter_n}.txt", verifier_raw)
+
+        try:
+            vobj = json.loads(verifier_raw)
+        except Exception:
+            vobj = {"pass": False, "issues": ["Verifier returned non-JSON"], "suggestions": ["Fix verifier prompt/output"]}
+
+        last_verifier = _normalize_verifier(vobj)
+        _write_text(run_dir / f"4_verifier_iter{iter_n}.json", json.dumps(last_verifier["raw"], ensure_ascii=False, indent=2))
+        _append_event(run_dir, {"type": "verifier", "pass": last_verifier["pass"], "issues": last_verifier["issues"], "suggestions": last_verifier["suggestions"], "next_action_hint": last_verifier["next_action_hint"], "notes": last_verifier["notes"]})
+
+        # 4) Stop conditions
+        if last_verifier["pass"] is True:
+            _append_event(run_dir, {"type": "summary", "verified_pass": True, "unverified": False, "verifier_report": last_verifier["raw"]})
+            print("[agent] done. verified_pass=True")
+            return 0
+
+        # If verifier says fail but gives NO actionable issues, stop to avoid death-spiral
+        if not last_verifier["issues"]:
+            _append_event(run_dir, {"type": "summary", "verified_pass": False, "unverified": False, "verifier_report": last_verifier["raw"]})
+            print("[agent] verifier failed but gave no issues; stopping to avoid loop.")
+            return 1
+
+    # max iters
+    _append_event(run_dir, {"type": "summary", "verified_pass": False, "unverified": False, "verifier_report": (last_verifier["raw"] if last_verifier else None)})
+    print("[agent] done. verified_pass=False (max iters)")
+    return 1

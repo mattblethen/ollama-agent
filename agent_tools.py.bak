@@ -1,0 +1,116 @@
+from __future__ import annotations
+import hashlib
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+
+EXCLUDE_DIRS = {".agent_logs", ".git", "node_modules", "__pycache__"}
+
+
+def sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()[:16]
+
+
+def read_text_capped(path: Path, cap_bytes: int = 120_000) -> Tuple[str, bool]:
+    """
+    Returns (text, truncated?)
+    """
+    data = path.read_bytes()
+    if len(data) <= cap_bytes:
+        return data.decode("utf-8", errors="replace"), False
+    head = data[: cap_bytes // 2]
+    tail = data[-cap_bytes // 2 :]
+    text = (
+        head.decode("utf-8", errors="replace")
+        + "\n\n/* --- TRUNCATED --- */\n\n"
+        + tail.decode("utf-8", errors="replace")
+    )
+    return text, True
+
+
+def list_repo_snapshot(root: Path, cap_files: int = 300) -> List[Dict[str, str]]:
+    """
+    Returns list of dicts: {path, size, sha16}
+    """
+    out: List[Dict[str, str]] = []
+    count = 0
+    for p in sorted(root.rglob("*")):
+        if count >= cap_files:
+            break
+        rel = p.relative_to(root)
+        if any(part in EXCLUDE_DIRS for part in rel.parts):
+            continue
+        if p.is_dir():
+            continue
+        try:
+            b = p.read_bytes()
+        except Exception:
+            continue
+        out.append({"path": str(rel), "size": str(len(b)), "sha": sha256_bytes(b)})
+        count += 1
+    return out
+
+
+def sanity_signals(root: Path) -> Dict[str, object]:
+    """
+    Local heuristic checks to prevent verifier hallucinations/regressions.
+    """
+    required = ["index.html", "style.css", "script.js"]
+    exists = {f: (root / f).exists() for f in required}
+
+    signals: Dict[str, object] = {"exists": exists, "markers": {}}
+
+    # scan script.js for required markers (cheap heuristic)
+    script = (root / "script.js")
+    if script.exists():
+        txt, _ = read_text_capped(script, cap_bytes=200_000)
+        markers = {
+            "Math.imul": "Math.imul" in txt,
+            "fnv": ("fnv" in txt.lower()) or ("FNV" in txt),
+            "checksum log": ("Seed:" in txt and "Checksum:" in txt) or ("Seed: ${" in txt and "Checksum:" in txt),
+            "self-test": ("self" in txt.lower() and "test" in txt.lower() and "PASS" in txt),
+            "legend": ("legend" in txt.lower()),
+        }
+        signals["markers"] = markers
+    return signals
+
+
+def build_verifier_context(root: Path) -> str:
+    """
+    Build a robust, bounded context for the verifier:
+    - snapshot list
+    - key file contents (capped)
+    - local sanity signals
+    """
+    snap = list_repo_snapshot(root)
+    sig = sanity_signals(root)
+
+    parts: List[str] = []
+    parts.append("REPO_SNAPSHOT (path, size, sha16):")
+    for item in snap:
+        parts.append(f"- {item['path']} | {item['size']} bytes | {item['sha']}")
+    parts.append("")
+    parts.append("LOCAL_SANITY_SIGNALS:")
+    parts.append(str(sig))
+    parts.append("")
+
+    for name in ("index.html", "style.css", "script.js"):
+        p = root / name
+        parts.append(f"FILE: {name}")
+        if not p.exists():
+            parts.append("(missing)")
+            parts.append("")
+            continue
+        txt, truncated = read_text_capped(p, cap_bytes=140_000 if name != "script.js" else 220_000)
+        if truncated:
+            parts.append("(content truncated)")
+        parts.append("```")
+        parts.append(txt)
+        parts.append("```")
+        parts.append("")
+
+    return "\n".join(parts)
