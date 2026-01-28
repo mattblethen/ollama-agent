@@ -13,7 +13,24 @@ def main():
     ap.add_argument("--max-iters", type=int, default=12)
     ap.add_argument("--timeout", type=int, default=180, help="Per-call timeout seconds (planner/coder/verifier)")
     ap.add_argument("--stall", type=int, default=240, help="Hard stall detector seconds (no new events)")
-    ap.add_argument("--no-llm-verifier", action="store_true", help="Disable LLM verifier; use local checks only")
+    ap.add_argument(
+        "--no-llm-verifier",
+        action="store_true",
+        help=(
+            "Disable LLM verifier (NOT recommended). Only generic safety/invariant checks will run. "
+            "Use --verify-plugin if you want deterministic checks."
+        ),
+    )
+    ap.add_argument(
+        "--verify-plugin",
+        action="append",
+        default=[],
+        choices=["grid_benchmark"],
+        help=(
+            "Optional deterministic verifier plugin(s). Example: --verify-plugin grid_benchmark. "
+            "Plugins are additive and run in addition to generic invariants + (optionally) LLM verification."
+        ),
+    )
     ap.add_argument("--prompt-max-chars", type=int, default=16000, help="Prompt size guard threshold (chars)")
     ap.add_argument("--chunk-max-chars", type=int, default=9000, help="Max chars per chunked subtask")
     ap.add_argument("--retries", type=int, default=2, help="Retries for Ollama calls")
@@ -31,6 +48,7 @@ def main():
         timeout_s=args.timeout,
         stall_s=args.stall,
         llm_verifier=not args.no_llm_verifier,
+        verify_plugins=args.verify_plugin,
         prompt_max_chars=args.prompt_max_chars,
         chunk_max_chars=args.chunk_max_chars,
         retries=args.retries,

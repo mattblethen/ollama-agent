@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ollama-agent UI</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: #0b0f14; color: #e6edf3;
+    }
+    header {
+      padding: 12px 16px; border-bottom: 1px solid #233041; background: #0d141c;
+      display: flex; align-items: center; gap: 12px;
+    }
+    header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+    main { display: grid; grid-template-columns: 420px 1fr; height: calc(100vh - 50px); }
+    .panel { padding: 14px 16px; border-right: 1px solid #233041; overflow: auto; }
+    .stream { padding: 14px 16px; overflow: auto; }
+    label { display: block; font-size: 12px; opacity: 0.9; margin: 10px 0 6px; }
+    input, select, textarea, button {
+      width: 100%;
+      box-sizing: border-box;
+      background: #111a24; color: #e6edf3;
+      border: 1px solid #243447;
+      border-radius: 10px;
+      padding: 10px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    textarea { min-height: 170px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .btnrow { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 12px; }
+    button { cursor: pointer; font-weight: 600; }
+    button:hover { border-color: #3b556f; }
+    .small { font-size: 12px; opacity: 0.8; margin-top: 8px; line-height: 1.4; }
+    .badge { font-size: 11px; padding: 2px 8px; border: 1px solid #2a3a4e; border-radius: 999px; opacity: 0.9; }
+    .log {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      line-height: 1.35;
+    }
+    .logline { padding: 6px 8px; border-bottom: 1px solid #15202b; }
+    .logline.dim { opacity: 0.75; }
+    .logline.err { color: #ff8b8b; }
+    .logline.ok  { color: #9ee493; }
+    .topbar { display:flex; gap:10px; align-items:center; }
+    .topbar > * { flex: 0 0 auto; }
+    .topbar .spacer { flex: 1 1 auto; }
+    a { color: #8bd5ff; text-decoration: none; }
+  </style>
+</head>
+<body>
+<header>
+  <div class="topbar" style="width:100%">
+    <h1>ollama-agent UI</h1>
+    <span class="badge" id="status">idle</span>
+    <div class="spacer"></div>
+    <button style="width:auto;padding:8px 10px" id="refreshModels">Refresh models</button>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <label>Ollama Base URL</label>
+    <input id="ollama" placeholder="http://192.168.5.72:11434" />
+
+    <label>Project root folder</label>
+    <input id="root" placeholder="~/projects/grid_benchmark" />
+
+    <label>Task prompt</label>
+    <textarea id="task" placeholder="Paste your task prompt here..."></textarea>
+
+    <div class="row">
+      <div>
+        <label>Planner model</label>
+        <select id="planner"></select>
+      </div>
+      <div>
+        <label>Coder model</label>
+        <select id="coder"></select>
+      </div>
+    </div>
+
+    <label>Verifier model</label>
+    <select id="verifier"></select>
+
+    <div class="row">
+      <div>
+        <label>Max iterations</label>
+        <input id="maxIters" type="number" min="1" max="200" value="12" />
+      </div>
+      <div>
+        <label>Per-call timeout (sec)</label>
+        <input id="timeout" type="number" min="10" max="99999" value="900" />
+      </div>
+    </div>
+
+    <div class="btnrow">
+      <button id="runBtn">Run</button>
+      <button id="continueBtn">Continue</button>
+      <button id="clearBtn">Clear log</button>
+    </div>
+
+    <div class="small">
+      <div><b>Run</b> starts a fresh agent run (same root).</div>
+      <div><b>Continue</b> loads the last UI state saved in <code>.agent_ui_state.json</code> inside the root, then runs again.</div>
+      <div style="margin-top:10px">Tip: keep separate roots for comparisons, e.g. <code>~/projects/grid_cmp_B1</code>.</div>
+    </div>
+  </section>
+
+  <section class="stream">
+    <div class="small" id="runMeta">No run yet.</div>
+    <div class="log" id="log"></div>
+  </section>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function setStatus(s) { $("status").textContent = s; }
+  function logLine(text, cls="") {
+    const el = document.createElement("div");
+    el.className = "logline " + cls;
+    el.textContent = text;
+    $("log").appendChild(el);
+    // autoscroll
+    $("log").parentElement.scrollTop = $("log").parentElement.scrollHeight;
+  }
+
+  function clearLog() { $("log").innerHTML = ""; }
+
+  async function getModels() {
+    const res = await fetch("/api/models");
+    if (!res.ok) throw new Error("Failed to fetch models");
+    const data = await res.json();
+    return data.models || [];
+  }
+
+  function fillSelect(sel, models, preferred=[]) {
+    sel.innerHTML = "";
+    const uniq = Array.from(new Set(models));
+    // Put preferred first if present
+    const ordered = [];
+    for (const p of preferred) if (uniq.includes(p)) ordered.push(p);
+    for (const m of uniq) if (!ordered.includes(m)) ordered.push(m);
+
+    for (const m of ordered) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      sel.appendChild(opt);
+    }
+  }
+
+  async function refreshModels() {
+    setStatus("loading models...");
+    try {
+      const models = await getModels();
+      fillSelect($("planner"), models, ["qwen3:30b", "gpt-oss:20b", "gemma3:27b"]);
+      fillSelect($("coder"), models, ["qwen3-coder:30b", "qwen3:30b"]);
+      fillSelect($("verifier"), models, ["qwen3:30b", "deepseek-r1:8b", "gpt-oss:20b"]);
+      setStatus("idle");
+      logLine(`[ui] Loaded ${models.length} model(s) from Ollama`);
+    } catch (e) {
+      setStatus("model fetch failed");
+      logLine(`[ui] ERROR: ${e.message}`, "err");
+    }
+  }
+
+  function readForm() {
+    return {
+      ollama: $("ollama").value.trim(),
+      root: $("root").value.trim(),
+      task: $("task").value,
+      planner: $("planner").value,
+      coder: $("coder").value,
+      verifier: $("verifier").value,
+      max_iters: Number($("maxIters").value || 12),
+      timeout: Number($("timeout").value || 900),
+    };
+  }
+
+  async function postJson(url, obj) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(obj),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  function streamRun(runId) {
+    setStatus("running");
+    $("runMeta").textContent = `Run ID: ${runId}`;
+    logLine(`--- streaming ${runId} ---`, "dim");
+
+    const es = new EventSource(`/api/stream?run_id=${encodeURIComponent(runId)}`);
+
+    es.addEventListener("hello", (ev) => {
+      // ignore
+    });
+
+    es.addEventListener("msg", (ev) => {
+      const msg = JSON.parse(ev.data);
+      const t = msg.t;
+      const d = msg.d;
+
+      if (t === "info") {
+        logLine(`[info] ${d.msg}`);
+        if (d.cmd) logLine(`$ ${d.cmd.join(" ")}`, "dim");
+      } else if (t === "stdout") {
+        logLine(d);
+      } else if (t === "run_dir") {
+        logLine(`[run_dir] ${d.run_dir}`, "dim");
+        $("runMeta").innerHTML = `Run ID: <b>${runId}</b> &nbsp; | &nbsp; Run dir: <code>${d.run_dir}</code>`;
+      } else if (t === "event") {
+        // compact event rendering
+        const typ = d.type || "event";
+        if (typ === "summary") {
+          const ok = d.verified_pass === true;
+          logLine(`[summary] verified_pass=${ok}`, ok ? "ok" : "err");
+        } else {
+          logLine(`[event] ${typ}`, "dim");
+        }
+      } else if (t === "event_raw") {
+        logLine(`[event_raw] ${d}`, "dim");
+      } else if (t === "error") {
+        logLine(`[error] ${JSON.stringify(d)}`, "err");
+      } else if (t === "done") {
+        logLine(`[done] exit_code=${d.exit_code}`, d.exit_code === 0 ? "ok" : "err");
+        setStatus("idle");
+        es.close();
+      } else {
+        logLine(`[${t}] ${JSON.stringify(d)}`, "dim");
+      }
+    });
+
+    es.onerror = () => {
+      logLine(`[ui] stream disconnected`, "err");
+      setStatus("idle");
+      es.close();
+    };
+  }
+
+  $("runBtn").addEventListener("click", async () => {
+    clearLog();
+    const cfg = readForm();
+    try {
+      const out = await postJson("/api/run", cfg);
+      streamRun(out.run_id);
+    } catch (e) {
+      logLine(`[ui] ERROR: ${e.message}`, "err");
+      setStatus("idle");
+    }
+  });
+
+  $("continueBtn").addEventListener("click", async () => {
+    const root = $("root").value.trim();
+    const ollama = $("ollama").value.trim();
+    if (!root) {
+      logLine("[ui] ERROR: root is required for Continue", "err");
+      return;
+    }
+    try {
+      const out = await postJson("/api/continue", { root, ollama });
+      logLine(`[ui] Loaded last config for root and started run`, "dim");
+      streamRun(out.run_id);
+    } catch (e) {
+      logLine(`[ui] ERROR: ${e.message}`, "err");
+    }
+  });
+
+  $("clearBtn").addEventListener("click", clearLog);
+  $("refreshModels").addEventListener("click", refreshModels);
+
+  // sensible defaults
+  $("ollama").value = "http://192.168.5.72:11434";
+
+  refreshModels();
+</script>
+</body>
+</html>

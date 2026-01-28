@@ -2,10 +2,18 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from agent_ollama import ollama_chat, ollama_tags
-from agent_tools import write_file, list_tree, read_text_snippet, local_verify_web_grid_project, ensure_dir
+from agent_tools import (
+    write_file,
+    list_tree,
+    read_text_snippet,
+    list_project_files,
+    local_verify_invariants,
+    local_verify_grid_benchmark,
+    ensure_dir,
+)
 
 def _now() -> float:
     return time.time()
@@ -22,6 +30,7 @@ class RunCfg:
     timeout_s: int
     stall_s: int
     llm_verifier: bool
+    verify_plugins: List[str]
     prompt_max_chars: int
     chunk_max_chars: int
     retries: int
@@ -44,14 +53,13 @@ def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
     text = text.strip()
     if not text:
         return None
-    # fast path
+
     try:
         obj = json.loads(text)
         return obj if isinstance(obj, dict) else None
     except Exception:
         pass
 
-    # find first '{' ... matching '}'
     start = text.find("{")
     if start < 0:
         return None
@@ -109,27 +117,32 @@ def _coder_prompt(task: str, plan_json: Dict[str, Any], tree: List[str], focus: 
         }
     ]
 
-def _llm_verify_prompt(task: str, tree: List[str], snippets: Dict[str, str]) -> List[Dict[str, str]]:
+def _llm_verify_prompt(task: str, acceptance: List[str], tree: List[str], snippets: Dict[str, str]) -> List[Dict[str, str]]:
+    acceptance_text = "\n".join(f"- {a}" for a in (acceptance or [])) or "(none provided)"
     return [
         {"role": "system", "content":
-            "You are a strict verifier. Decide pass/fail. Output ONLY JSON.\n"
+            "You are a strict verifier. Decide pass/fail based on the acceptance criteria. Output ONLY JSON.\n"
             "Format:\n"
             "{\n"
-            '  "pass": true/false,\n'
-            '  "reasons": ["..."]\n'
+            '  \"pass\": true/false,\n'
+            '  \"issues\": [\"...\"],\n'
+            '  \"suggestions\": [\"...\"],\n'
+            '  \"notes\": \"optional\"\n'
             "}\n"
+            "Rules:\n"
+            "- Be specific and actionable.\n"
+            "- If something is missing, say exactly what file/element/function is missing.\n"
+            "- Do NOT invent files that do not exist.\n"
         },
         {"role": "user", "content":
             f"TASK:\n{task}\n\n"
-            f"FILES:\n" + "\n".join(tree[:250]) + "\n\n"
+            f"ACCEPTANCE_CRITERIA:\n{acceptance_text}\n\n"
+            f"FILES:\n" + "\n".join(tree[:350]) + "\n\n"
             "SNIPPETS:\n" + json.dumps(snippets, ensure_ascii=False) + "\n"
         }
     ]
 
 def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
-    """
-    Ask planner model to chunk huge tasks into smaller sequential subtasks.
-    """
     msgs = [
         {"role": "system", "content": "You split tasks into smaller steps. Output ONLY JSON."},
         {"role": "user", "content":
@@ -144,9 +157,8 @@ def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
     obj = _extract_json_obj(raw) or {}
     subs = obj.get("subtasks") if isinstance(obj.get("subtasks"), list) else None
     if not subs:
-        # fallback naive split
         return [task[:cfg.chunk_max_chars]]
-    cleaned = []
+    cleaned: List[str] = []
     for s in subs:
         if not isinstance(s, str):
             continue
@@ -169,6 +181,7 @@ def run_agent(
     timeout_s: int,
     stall_s: int,
     llm_verifier: bool,
+    verify_plugins: List[str],
     prompt_max_chars: int,
     chunk_max_chars: int,
     retries: int,
@@ -185,6 +198,7 @@ def run_agent(
         timeout_s=timeout_s,
         stall_s=stall_s,
         llm_verifier=llm_verifier,
+        verify_plugins=verify_plugins,
         prompt_max_chars=prompt_max_chars,
         chunk_max_chars=chunk_max_chars,
         retries=retries,
@@ -210,14 +224,12 @@ def run_agent(
         _log_event(run_dir, {"type": "error", "where": "ollama_tags", "error": str(e)})
         raise
 
-    # prompt size guard + chunking
     effective_tasks = [cfg.task]
     if len(cfg.task) > cfg.prompt_max_chars:
         _log_event(run_dir, {"type": "note", "where": "prompt_guard", "msg": f"Task too large ({len(cfg.task)} chars) -> chunking"})
         effective_tasks = _chunk_task_via_llm(cfg, cfg.task, run_dir)
         _save_text(run_dir, "task_chunks.json", json.dumps({"subtasks": effective_tasks}, indent=2, ensure_ascii=False))
 
-    # Execute subtasks sequentially in one run
     for sub_i, subtask in enumerate(effective_tasks, start=1):
         focus_prefix = f"[subtask {sub_i}/{len(effective_tasks)}] "
 
@@ -231,47 +243,110 @@ def run_agent(
         _log_event(run_dir, {"type": "plan", "sub": sub_i, "plan": plan_json.get("plan", []), "acceptance": plan_json.get("acceptance", [])})
 
         last_progress = _now()
+        last_verifier_report: Dict[str, Any] = {}
 
         for it in range(1, cfg.max_iters + 1):
             _log_event(run_dir, {"type": "iter_start", "iter": it, "sub": sub_i})
             print(f"[agent] Iteration {it}/{cfg.max_iters} {focus_prefix}")
 
-            # Hard stall detector (no new writes/events)
             if (_now() - last_progress) > cfg.stall_s:
                 _log_event(run_dir, {"type": "stall_abort", "iter": it, "sub": sub_i, "stall_s": cfg.stall_s})
                 raise RuntimeError(f"Hard stall detected: no progress for {cfg.stall_s}s")
 
             tree = list_tree(cfg.root)
 
-            # Local deterministic verifier first
-            ok_local, issues_local = local_verify_web_grid_project(cfg.root)
-            if ok_local:
-                # optional LLM verifier
-                if cfg.llm_verifier:
-                    snippets = {
-                        "index.html": read_text_snippet(cfg.root, "index.html", 6000),
-                        "style.css": read_text_snippet(cfg.root, "style.css", 6000),
-                        "script.js": read_text_snippet(cfg.root, "script.js", 9000),
-                    }
-                    _log_event(run_dir, {"type": "note", "where": "verifier_request", "iter": it, "sub": sub_i, "model": cfg.verifier_model})
-                    vraw = ollama_chat(cfg.base_url, cfg.verifier_model, _llm_verify_prompt(subtask, tree, snippets),
-                                      temperature=0.1, timeout_s=cfg.timeout_s, retries=cfg.retries)
-                    _save_text(run_dir, f"4_verifier_raw_sub{sub_i}_iter{it}.txt", vraw)
-                    vobj = _extract_json_obj(vraw) or {"pass": False, "reasons": ["Verifier returned non-JSON"]}
-                    (run_dir / f"4_verifier_sub{sub_i}_iter{it}.json").write_text(json.dumps(vobj, indent=2, ensure_ascii=False), encoding="utf-8")
-                    _log_event(run_dir, {"type": "verifier", "pass": bool(vobj.get("pass")), "issues": vobj.get("reasons", [])})
+            # --- Verification stack (project-agnostic by default) ---
+            ok_inv, issues_inv = local_verify_invariants(cfg.root)
+            _log_event(run_dir, {"type": "verify_local", "iter": it, "sub": sub_i, "name": "invariants", "pass": ok_inv, "issues": issues_inv})
 
-                    if bool(vobj.get("pass")):
-                        _log_event(run_dir, {"type": "summary", "verified_pass": True, "sub": sub_i, "verifier_report": vobj})
-                        print("[agent] done. verified_pass=True")
-                        break
+            plugin_issues: List[str] = []
+            plugin_pass = True
+            for plug in (cfg.verify_plugins or []):
+                if plug == "grid_benchmark":
+                    okp, isp = local_verify_grid_benchmark(cfg.root)
                 else:
-                    _log_event(run_dir, {"type": "summary", "verified_pass": True, "sub": sub_i, "verifier_report": {"pass": True, "reasons": []}})
-                    print("[agent] done. verified_pass=True (local)")
-                    break
+                    okp, isp = False, [f"Unknown verify plugin: {plug}"]
+                plugin_pass = plugin_pass and okp
+                plugin_issues.extend([f"[{plug}] {x}" for x in isp])
+                _log_event(run_dir, {"type": "verify_local", "iter": it, "sub": sub_i, "name": plug, "pass": okp, "issues": isp})
 
-            # If local verifier fails, instruct coder explicitly to fix issues.
-            focus = "Fix the following issues:\n- " + "\n- ".join(issues_local[:12])
+            # LLM verifier is the primary acceptance gate
+            vobj: Dict[str, Any] = {"pass": False, "issues": [], "suggestions": []}
+            ok_llm = False
+            llm_issues: List[str] = []
+            llm_suggestions: List[str] = []
+
+            if cfg.llm_verifier:
+                proj_files = list_project_files(cfg.root, max_files=80)
+                prefer = ["README.md", "index.html", "main.py", "app.py", "package.json", "style.css", "script.js"]
+                chosen: List[str] = []
+                for p in prefer:
+                    if p in proj_files and p not in chosen:
+                        chosen.append(p)
+                for p in proj_files:
+                    if p in chosen:
+                        continue
+                    if Path(p).suffix.lower() in {".md", ".txt", ".py", ".js", ".ts", ".html", ".css", ".json"}:
+                        chosen.append(p)
+                    if len(chosen) >= 8:
+                        break
+
+                snippets = {p: read_text_snippet(cfg.root, p, 7000) for p in chosen}
+                _log_event(run_dir, {"type": "note", "where": "verifier_request", "iter": it, "sub": sub_i, "model": cfg.verifier_model, "files": chosen})
+                vraw = ollama_chat(
+                    cfg.base_url,
+                    cfg.verifier_model,
+                    _llm_verify_prompt(subtask, list(plan_json.get("acceptance", []) or []), tree, snippets),
+                    temperature=0.1,
+                    timeout_s=cfg.timeout_s,
+                    retries=cfg.retries,
+                )
+                _save_text(run_dir, f"4_verifier_raw_sub{sub_i}_iter{it}.txt", vraw)
+                vobj = _extract_json_obj(vraw) or {"pass": False, "issues": ["Verifier returned non-JSON"], "suggestions": []}
+                (run_dir / f"4_verifier_sub{sub_i}_iter{it}.json").write_text(json.dumps(vobj, indent=2, ensure_ascii=False), encoding="utf-8")
+                ok_llm = bool(vobj.get("pass"))
+                llm_issues = [x for x in (vobj.get("issues") or []) if isinstance(x, str)]
+                llm_suggestions = [x for x in (vobj.get("suggestions") or []) if isinstance(x, str)]
+                _log_event(run_dir, {"type": "verify_llm", "iter": it, "sub": sub_i, "pass": ok_llm, "issues": llm_issues, "suggestions": llm_suggestions})
+
+            if ok_inv and plugin_pass and (ok_llm if cfg.llm_verifier else True):
+                _log_event(
+                    run_dir,
+                    {
+                        "type": "summary",
+                        "verified_pass": True,
+                        "sub": sub_i,
+                        "verifier_report": {
+                            "invariants": {"pass": ok_inv, "issues": issues_inv},
+                            "plugins": {"pass": plugin_pass, "issues": plugin_issues},
+                            "llm": vobj if cfg.llm_verifier else {"pass": True, "issues": [], "suggestions": []},
+                        },
+                    },
+                )
+                print("[agent] done. verified_pass=True")
+                break
+
+            last_verifier_report = {
+                "invariants": {"pass": ok_inv, "issues": issues_inv},
+                "plugins": {"pass": plugin_pass, "issues": plugin_issues, "enabled": list(cfg.verify_plugins or [])},
+                "llm": vobj if cfg.llm_verifier else {"pass": True, "issues": [], "suggestions": []},
+            }
+
+            focus_lines: List[str] = []
+            if not ok_inv:
+                focus_lines.extend(issues_inv)
+            if not plugin_pass:
+                focus_lines.extend(plugin_issues)
+            if cfg.llm_verifier and not ok_llm:
+                focus_lines.extend(llm_issues)
+                if llm_suggestions:
+                    focus_lines.append("--- Suggestions (hints) ---")
+                    focus_lines.extend(llm_suggestions[:5])
+
+            if not focus_lines:
+                focus_lines.append("Verifier did not provide actionable issues. Make a small, safe improvement toward the acceptance criteria.")
+
+            focus = "Fix the following issues (in order). Do NOT introduce new files/features unless required.\n- " + "\n- ".join(focus_lines[:10])
             msgs = _coder_prompt(subtask, plan_json, tree, focus)
 
             _log_event(run_dir, {"type": "note", "where": "coder_request", "iter": it, "sub": sub_i, "model": cfg.coder_model, "timeout_s": cfg.timeout_s})
@@ -282,6 +357,17 @@ def run_agent(
 
             obj = _extract_json_obj(coder_raw) or {}
             writes = obj.get("writes") if isinstance(obj.get("writes"), list) else []
+
+            if not writes:
+                _log_event(
+                    run_dir,
+                    {
+                        "type": "coder_no_writes",
+                        "iter": it,
+                        "sub": sub_i,
+                        "msg": "Coder returned zero writes. Next iteration should explicitly write required files.",
+                    },
+                )
 
             changes = []
             for w in writes:
@@ -300,8 +386,19 @@ def run_agent(
                 last_progress = _now()
 
         else:
-            # max iters exceeded for subtask
-            _log_event(run_dir, {"type": "summary", "verified_pass": False, "sub": sub_i, "verifier_report": {"pass": False, "reasons": ["max iters"]}})
+            _log_event(
+                run_dir,
+                {
+                    "type": "summary",
+                    "verified_pass": False,
+                    "sub": sub_i,
+                    "verifier_report": {
+                        "pass": False,
+                        "reasons": ["max iters"],
+                        "last": last_verifier_report,
+                    },
+                },
+            )
             print("[agent] done. verified_pass=False (max iters)")
             return 1
 

@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterable
 
 TEXT_EXT_ALLOW = {".html", ".css", ".js", ".ts", ".json", ".md", ".txt", ".py"}
 
@@ -53,6 +53,22 @@ def list_tree(root: Path, max_files: int = 400) -> List[str]:
             break
     return out
 
+def list_project_files(root: Path, max_files: int = 600, exclude_prefixes: Iterable[str] = (".agent_logs",)) -> List[str]:
+    """List files under root, excluding agent internals (e.g., .agent_logs)."""
+    root = root.resolve()
+    out: List[str] = []
+    for p in sorted(root.rglob("*")):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if any(rel == pref or rel.startswith(pref + "/") for pref in exclude_prefixes):
+            continue
+        out.append(rel)
+        if len(out) >= max_files:
+            out.append("... (truncated)")
+            break
+    return out
+
 def read_text_snippet(root: Path, rel: str, max_chars: int = 6000) -> str:
     p = safe_relpath(root.resolve(), rel)
     if p.suffix.lower() not in TEXT_EXT_ALLOW:
@@ -72,14 +88,31 @@ def file_exists(root: Path, rel: str) -> bool:
     except Exception:
         return False
 
-def local_verify_web_grid_project(root: Path) -> Tuple[bool, List[str]]:
+def local_verify_invariants(root: Path) -> Tuple[bool, List[str]]:
+    """Project-agnostic safety/invariant checks.
+
+    These should remain stable across ANY project type.
     """
-    Deterministic verifier for your benchmark:
-      - index.html, style.css, script.js exist
-      - html references css + js
-      - JS uses Math.imul and logs Seed/Checksum
-      - JS contains a self-test and legend rendering (either via DOM or innerHTML)
-      - CSS contains terrain classes used by JS
+    issues: List[str] = []
+
+    # Root must exist
+    if not root.exists() or not root.is_dir():
+        issues.append("Project root does not exist or is not a directory")
+        return False, issues
+
+    # There should be at least one non-internal file (excluding .agent_logs)
+    files = list_project_files(root, max_files=50)
+    real_files = [f for f in files if not f.startswith("... ")]
+    if not real_files:
+        issues.append("No project files found (only .agent_logs or empty root)")
+
+    return (len(issues) == 0), issues
+
+
+def local_verify_grid_benchmark(root: Path) -> Tuple[bool, List[str]]:
+    """Deterministic verifier plugin for the specific HTML grid benchmark.
+
+    This is intentionally *not* used unless enabled via --verify-plugin grid_benchmark.
     """
     issues = []
     must = ["index.html", "style.css", "script.js"]
@@ -114,7 +147,6 @@ def local_verify_web_grid_project(root: Path) -> Tuple[bool, List[str]]:
 
     # terrain class alignment:
     # We accept either .water/.grass/.mountain OR .cell-water/.cell-grass/.cell-mountain
-    js_uses_water = (".water" in js) or ("water" in js.lower())
     css_has_simple = (".water" in css) and (".grass" in css) and (".mountain" in css)
     css_has_cell = (".cell-water" in css) and (".cell-grass" in css) and (".cell-mountain" in css)
     if not (css_has_simple or css_has_cell):
