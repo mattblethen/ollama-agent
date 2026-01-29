@@ -6,10 +6,14 @@ Minimal Web UI server for ollama-agent
 - Lists local Ollama models
 - Starts agent runs (subprocess calling agent.py)
 - Streams stdout + events.jsonl lines via SSE
-- NEW: Streams *raw LLM outputs* (planner/coder/verifier) live by watching run_dir text files:
+- Streams *raw LLM outputs* (planner/coder/verifier) live by watching run_dir text files:
     1_planner_raw_subX.txt
     2_coder_raw_subX_iterY.txt
     4_verifier_raw_subX_iterY.txt
+- NEW: Streams *plan* payload reliably by watching for plan cache files:
+    1_plan_subX.json
+  and emitting an event shaped like {"type":"plan","sub":X,"plan":[...],"acceptance":[...]}
+  This fixes cases where the run completes quickly and the plan event is missed.
 - Supports Continue using per-root saved config
 
 No external deps. Python 3.9+ recommended.
@@ -151,8 +155,11 @@ class RunState:
     _proc: Optional[subprocess.Popen] = None
     _events_pos: int = 0
 
-    # NEW: track raw llm files already streamed
+    # track raw llm files already streamed
     _llm_seen: set[str] = None  # type: ignore[assignment]
+
+    # NEW: track plan files already streamed (by sub number)
+    _plan_seen: set[int] = None  # type: ignore[assignment]
 
 
 def save_root_state(root: Path, cfg: RunConfig) -> None:
@@ -178,7 +185,7 @@ def push(rs: RunState, typ: str, payload: Any) -> None:
     rs.q.put({"t": typ, "d": payload, "ts": now_ms()})
 
 
-# ---------- NEW: raw LLM file detection helpers ----------
+# ---------- raw LLM file detection helpers ----------
 
 RAW_PATTERNS = [
     # planner
@@ -237,10 +244,63 @@ def stream_new_llm_files(rs: RunState, rd: Path) -> None:
         push(rs, "error", {"where": "stream_new_llm_files", "error": str(e)})
 
 
+# ---------- NEW: plan file fallback ----------
+
+PLAN_FILE_RE = re.compile(r"^1_plan_sub(?P<sub>\d+)\.json$")
+
+
+def stream_new_plan_files(rs: RunState, rd: Path) -> None:
+    """
+    Check run_dir for cached plan files; emit a synthetic plan event when found.
+
+    This is a robustness layer: in very fast runs the UI may miss the live "plan" event
+    from events.jsonl, but the plan JSON file still exists. This ensures the Plan panel
+    is populated whenever the file exists.
+    """
+    if rs._plan_seen is None:
+        rs._plan_seen = set()
+
+    try:
+        for p in rd.iterdir():
+            if not p.is_file():
+                continue
+            m = PLAN_FILE_RE.match(p.name)
+            if not m:
+                continue
+
+            sub = int(m.group("sub"))
+            if sub in rs._plan_seen:
+                continue
+
+            # mark seen before parsing (prevents rapid retry loops if file is mid-write)
+            rs._plan_seen.add(sub)
+
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                push(rs, "error", {"where": "plan_file_parse", "file": p.name, "error": str(e)})
+                continue
+
+            plan = []
+            acceptance = []
+            if isinstance(obj, dict):
+                if isinstance(obj.get("plan"), list):
+                    plan = obj.get("plan") or []
+                if isinstance(obj.get("acceptance"), list):
+                    acceptance = obj.get("acceptance") or []
+
+            # Emit the same shape the UI expects from the agent events stream.
+            push(rs, "event", {"type": "plan", "sub": sub, "plan": plan, "acceptance": acceptance})
+            push(rs, "info", {"msg": f"Loaded plan from {p.name} (fallback)"})
+
+    except Exception as e:
+        push(rs, "error", {"where": "stream_new_plan_files", "error": str(e)})
+
+
 # ---------- agent runner ----------
 
 def run_agent_subprocess(rs: RunState) -> None:
-    """Launch agent.py as a subprocess, stream stdout, tail events.jsonl, and stream raw LLM files."""
+    """Launch agent.py as a subprocess, stream stdout, tail events.jsonl, and stream raw LLM/plan files."""
     root = Path(rs.cfg.root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
@@ -289,7 +349,7 @@ def run_agent_subprocess(rs: RunState) -> None:
 
     run_dir_re = re.compile(r"run_dir\s*=\s*(.+)$")
 
-    def tail_events_and_llm_loop():
+    def tail_events_llm_and_plan_loop():
         last_dir: Optional[Path] = None
         while not rs.stop_evt.is_set():
             rd: Optional[Path] = None
@@ -307,6 +367,7 @@ def run_agent_subprocess(rs: RunState) -> None:
                     rs.run_dir = str(rd)
                     rs._events_pos = 0
                     rs._llm_seen = set()
+                    rs._plan_seen = set()
                     push(rs, "run_dir", {"run_dir": rs.run_dir})
 
                 # Stream events.jsonl
@@ -319,12 +380,15 @@ def run_agent_subprocess(rs: RunState) -> None:
                     except Exception:
                         push(rs, "event_raw", line)
 
-                # NEW: Stream any raw LLM files that appear
+                # Stream any raw LLM files that appear
                 stream_new_llm_files(rs, rd)
+
+                # NEW: Stream cached plan files (fallback)
+                stream_new_plan_files(rs, rd)
 
             time.sleep(0.20)
 
-    tail_thr = threading.Thread(target=tail_events_and_llm_loop, daemon=True)
+    tail_thr = threading.Thread(target=tail_events_llm_and_plan_loop, daemon=True)
     tail_thr.start()
 
     try:
@@ -367,6 +431,7 @@ def start_run(cfg: RunConfig) -> RunState:
     run_id = f"run_{now_ms()}"
     rs = RunState(run_id=run_id, cfg=cfg, started_ms=now_ms())
     rs._llm_seen = set()
+    rs._plan_seen = set()
     with RUNS_LOCK:
         RUNS[run_id] = rs
     t = threading.Thread(target=run_agent_subprocess, args=(rs,), daemon=True)

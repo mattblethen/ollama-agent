@@ -15,26 +15,91 @@ from agent_tools import (
     ensure_dir,
 )
 
+
+STATE_FILE_NAME = ".agent_state.json"
+
+
 def _now() -> float:
     return time.time()
 
-@dataclass
-class RunCfg:
-    root: Path
-    task: str
-    base_url: str
-    planner_model: str
-    coder_model: str
-    verifier_model: str
-    max_iters: int
-    timeout_s: int
-    stall_s: int
-    llm_verifier: bool
-    verify_plugins: List[str]
-    prompt_max_chars: int
-    chunk_max_chars: int
-    retries: int
-    run_seed: str
+
+def _safe_json_load(p: Path) -> Optional[dict]:
+    try:
+        if not p.exists():
+            return None
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_json_write(p: Path, obj: dict) -> None:
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _bounded_list(xs: List[str], n: int) -> List[str]:
+    return xs[:n] if len(xs) > n else xs
+
+
+def _summarize_changes(changes: List[dict], max_items: int = 20) -> Dict[str, Any]:
+    """
+    changes: output from agent_tools.write_file results
+    Shape varies a bit, so keep it defensive.
+    """
+    out: Dict[str, Any] = {
+        "count": 0,
+        "files": [],
+    }
+    if not changes:
+        return out
+    files: List[str] = []
+    for c in changes:
+        if not isinstance(c, dict):
+            continue
+        p = c.get("path") or c.get("file") or c.get("relpath")
+        if isinstance(p, str):
+            files.append(p)
+    files = sorted(set(files))
+    out["count"] = len(files)
+    out["files"] = _bounded_list(files, max_items)
+    return out
+
+
+def _derive_open_issues(verifier_report: Dict[str, Any], max_items: int = 12) -> List[str]:
+    issues: List[str] = []
+    if not isinstance(verifier_report, dict):
+        return issues
+
+    inv = verifier_report.get("invariants")
+    if isinstance(inv, dict) and not inv.get("pass", True):
+        for s in inv.get("issues") or []:
+            if isinstance(s, str) and s.strip():
+                issues.append(s.strip())
+
+    plugs = verifier_report.get("plugins")
+    if isinstance(plugs, dict) and not plugs.get("pass", True):
+        for s in plugs.get("issues") or []:
+            if isinstance(s, str) and s.strip():
+                issues.append(s.strip())
+
+    llm = verifier_report.get("llm")
+    if isinstance(llm, dict) and not llm.get("pass", True):
+        for s in llm.get("issues") or []:
+            if isinstance(s, str) and s.strip():
+                issues.append(s.strip())
+
+    # Dedup + cap
+    seen = set()
+    cleaned: List[str] = []
+    for s in issues:
+        if s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
 
 def _log_event(run_dir: Path, evt: Dict[str, Any]) -> None:
     evt = dict(evt)
@@ -42,8 +107,10 @@ def _log_event(run_dir: Path, evt: Dict[str, Any]) -> None:
     with (run_dir / "events.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(evt, ensure_ascii=False) + "\n")
 
+
 def _save_text(run_dir: Path, name: str, content: str) -> None:
     (run_dir / name).write_text(content, encoding="utf-8")
+
 
 def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
     """
@@ -79,7 +146,50 @@ def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
                     return None
     return None
 
-def _planner_prompt(task: str) -> List[Dict[str, str]]:
+
+def _state_path(root: Path) -> Path:
+    return root / STATE_FILE_NAME
+
+
+def _load_state(root: Path) -> Optional[dict]:
+    return _safe_json_load(_state_path(root))
+
+
+def _write_state(root: Path, state: dict) -> None:
+    _safe_json_write(_state_path(root), state)
+
+
+def _build_context_pack(
+    root: Path,
+    task: str,
+    plan_json: Optional[Dict[str, Any]],
+    verifier_report: Optional[Dict[str, Any]],
+    changes: Optional[List[dict]],
+    run_dir: Optional[Path],
+) -> Dict[str, Any]:
+    """
+    This is the *bounded* memory surface the planner should read.
+    It prevents prompt bloat by keeping only the latest, summarized signal.
+    """
+    tree = list_tree(root)
+    pack: Dict[str, Any] = {
+        "version": 1,
+        "updated_ts": _now(),
+        "task": task,
+        "run_dir": str(run_dir) if run_dir else "",
+        "files_top": _bounded_list(tree, 250),
+        "latest_plan": {
+            "acceptance": (plan_json or {}).get("acceptance", []) if isinstance(plan_json, dict) else [],
+            "plan": (plan_json or {}).get("plan", []) if isinstance(plan_json, dict) else [],
+        },
+        "latest_verifier": verifier_report if isinstance(verifier_report, dict) else {},
+        "latest_changes": _summarize_changes(changes or [], max_items=30),
+        "open_issues": _derive_open_issues(verifier_report or {}, max_items=12),
+    }
+    return pack
+
+
+def _planner_prompt_fresh(task: str) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": "You are a planning assistant. Output ONLY JSON."},
         {
@@ -88,13 +198,49 @@ def _planner_prompt(task: str) -> List[Dict[str, str]]:
                 "Create a short executable plan as JSON.\n\n"
                 "Return JSON like:\n"
                 "{\n"
-                '  "acceptance": ["..."],\n'
-                '  "plan": [{"step": 1, "title": "...", "details": "...", "files_likely": ["..."]}]\n'
+                '  \"acceptance\": [\"...\"],\n'
+                '  \"plan\": [{\"step\": 1, \"title\": \"...\", \"details\": \"...\", \"files_likely\": [\"...\"]}]\n'
                 "}\n\n"
+                "Constraints:\n"
+                "- Keep the plan minimal.\n"
+                "- Do NOT restate the task.\n"
+                "- Aim for <= 8 steps.\n\n"
                 f"TASK:\n{task}\n"
             ),
         },
     ]
+
+
+def _planner_prompt_patch(task: str, context_pack: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Patch-mode planner: fast, bounded, and avoids re-planning the universe.
+    """
+    return [
+        {"role": "system", "content": "You are a planning assistant. Output ONLY JSON."},
+        {
+            "role": "user",
+            "content": (
+                "You are continuing work in an existing project.\n"
+                "Your job is to produce a MINIMAL patch plan to satisfy the task and resolve open issues.\n\n"
+                "Return ONLY JSON with the same shape:\n"
+                "{\n"
+                '  \"acceptance\": [\"...\"],\n'
+                '  \"plan\": [{\"step\": 1, \"title\": \"...\", \"details\": \"...\", \"files_likely\": [\"...\"]}]\n'
+                "}\n\n"
+                "Rules:\n"
+                "- Do NOT rewrite the entire plan unless necessary.\n"
+                "- Focus on the CURRENT open issues and the smallest set of file edits.\n"
+                "- Prefer PATCH steps like 'edit X', 'adjust Y', 'add missing Z'.\n"
+                "- If the project already meets acceptance, return plan=[] and acceptance unchanged.\n"
+                "- Aim for <= 6 steps.\n"
+                "- Do NOT restate the task.\n\n"
+                f"TASK:\n{task}\n\n"
+                "CONTEXT_PACK (latest snapshot, bounded):\n"
+                f"{json.dumps(context_pack, ensure_ascii=False)}\n"
+            ),
+        },
+    ]
+
 
 def _coder_prompt(task: str, plan_json: Dict[str, Any], tree: List[str], focus: str) -> List[Dict[str, str]]:
     tree_text = "\n".join(tree[:300])
@@ -105,8 +251,8 @@ def _coder_prompt(task: str, plan_json: Dict[str, Any], tree: List[str], focus: 
                 "You are a coding agent. You MUST respond with ONLY JSON.\n"
                 "Your JSON must have this shape:\n"
                 "{\n"
-                '  "writes": [{"path":"relative/path.ext","content":"..."}],\n'
-                '  "notes": ["..."]\n'
+                '  \"writes\": [{\"path\":\"relative/path.ext\",\"content\":\"...\"}],\n'
+                '  \"notes\": [\"...\"]\n'
                 "}\n"
                 "Rules:\n"
                 "- Always include FULL FILE CONTENT in each write.\n"
@@ -126,6 +272,7 @@ def _coder_prompt(task: str, plan_json: Dict[str, Any], tree: List[str], focus: 
         },
     ]
 
+
 def _llm_verify_prompt(task: str, acceptance: List[str], tree: List[str], snippets: Dict[str, str]) -> List[Dict[str, str]]:
     acceptance_text = "\n".join(f"- {a}" for a in (acceptance or [])) or "(none provided)"
     return [
@@ -135,10 +282,10 @@ def _llm_verify_prompt(task: str, acceptance: List[str], tree: List[str], snippe
                 "You are a strict verifier. Decide pass/fail based on the acceptance criteria. Output ONLY JSON.\n"
                 "Format:\n"
                 "{\n"
-                '  "pass": true/false,\n'
-                '  "issues": ["..."],\n'
-                '  "suggestions": ["..."],\n'
-                '  "notes": "optional"\n'
+                '  \"pass\": true/false,\n'
+                '  \"issues\": [\"...\"],\n'
+                '  \"suggestions\": [\"...\"],\n'
+                '  \"notes\": \"optional\"\n'
                 "}\n"
                 "Rules:\n"
                 "- Be specific and actionable.\n"
@@ -157,14 +304,15 @@ def _llm_verify_prompt(task: str, acceptance: List[str], tree: List[str], snippe
         },
     ]
 
-def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
+
+def _chunk_task_via_llm(cfg: "RunCfg", task: str, run_dir: Path) -> List[str]:
     msgs = [
         {"role": "system", "content": "You split tasks into smaller steps. Output ONLY JSON."},
         {
             "role": "user",
             "content": (
                 "Split the following task into 2-6 sequential subtasks that can be executed one-by-one.\n"
-                'Return JSON: {"subtasks": ["...", "..."]}\n\n'
+                "Return JSON: {\"subtasks\": [\"...\", \"...\"]}\n\n"
                 f"TASK:\n{task}\n"
             ),
         },
@@ -181,7 +329,7 @@ def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
     obj = _extract_json_obj(raw) or {}
     subs = obj.get("subtasks") if isinstance(obj.get("subtasks"), list) else None
     if not subs:
-        return [task[:cfg.chunk_max_chars]]
+        return [task[: cfg.chunk_max_chars]]
     cleaned: List[str] = []
     for s in subs:
         if not isinstance(s, str):
@@ -194,63 +342,25 @@ def _chunk_task_via_llm(cfg: RunCfg, task: str, run_dir: Path) -> List[str]:
         cleaned.append(s)
     return cleaned[:6] if cleaned else [task[: cfg.chunk_max_chars]]
 
-# -------- NEW: plan-step event helpers --------
 
-def _safe_plan_steps(plan_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    p = plan_json.get("plan", [])
-    if not isinstance(p, list):
-        return []
-    out = []
-    for s in p:
-        if isinstance(s, dict):
-            out.append(s)
-    return out
+@dataclass
+class RunCfg:
+    root: Path
+    task: str
+    base_url: str
+    planner_model: str
+    coder_model: str
+    verifier_model: str
+    max_iters: int
+    timeout_s: int
+    stall_s: int
+    llm_verifier: bool
+    verify_plugins: List[str]
+    prompt_max_chars: int
+    chunk_max_chars: int
+    retries: int
+    run_seed: str
 
-def _step_meta(plan_steps: List[Dict[str, Any]], step_num: int) -> Dict[str, Any]:
-    """
-    Best-effort lookup of title/details from plan.
-    step_num is 1-based.
-    """
-    if step_num <= 0:
-        step_num = 1
-
-    # Try: match dict["step"] first
-    for s in plan_steps:
-        try:
-            if int(s.get("step", -1)) == step_num:
-                return {
-                    "title": s.get("title"),
-                    "details": s.get("details"),
-                    "files_likely": s.get("files_likely"),
-                }
-        except Exception:
-            continue
-
-    # Fallback: index-based
-    idx = step_num - 1
-    if 0 <= idx < len(plan_steps):
-        s = plan_steps[idx]
-        return {
-            "title": s.get("title"),
-            "details": s.get("details"),
-            "files_likely": s.get("files_likely"),
-        }
-
-    return {"title": None, "details": None, "files_likely": None}
-
-def _map_iter_to_step(plan_steps: List[Dict[str, Any]], it: int) -> int:
-    """
-    Simple, stable mapping:
-    - if plan has N steps, iteration 1..N maps to step 1..N
-    - iterations beyond N cap at step N (so we don’t exceed UI checklist bounds)
-    - if plan is empty, map step_num = it (still emits granular progress)
-    """
-    if it <= 0:
-        it = 1
-    n = len(plan_steps)
-    if n <= 0:
-        return it
-    return min(it, n)
 
 def run_agent(
     root: str,
@@ -298,8 +408,6 @@ def run_agent(
 
     _log_event(run_dir, {"type": "start", "root": str(cfg.root), "task": cfg.task, "ollama_base_url": cfg.base_url})
     _log_event(run_dir, {"type": "models", "planner": cfg.planner_model, "coder": cfg.coder_model, "verifier": cfg.verifier_model})
-    if cfg.run_seed:
-        _log_event(run_dir, {"type": "run_seed", "seed": cfg.run_seed})
 
     # quick connectivity sanity
     try:
@@ -307,6 +415,11 @@ def run_agent(
     except Exception as e:
         _log_event(run_dir, {"type": "error", "where": "ollama_tags", "error": str(e)})
         raise
+
+    # Load existing state (if any) to enable fast patch planning
+    prior_state = _load_state(cfg.root)
+    if prior_state:
+        _log_event(run_dir, {"type": "note", "where": "state", "msg": f"Loaded {STATE_FILE_NAME} for patch planning"})
 
     effective_tasks = [cfg.task]
     if len(cfg.task) > cfg.prompt_max_chars:
@@ -317,11 +430,20 @@ def run_agent(
     for sub_i, subtask in enumerate(effective_tasks, start=1):
         focus_prefix = f"[subtask {sub_i}/{len(effective_tasks)}] "
 
+        # Planner: if we have prior state, do PATCH-mode planning to avoid re-planning + reduce latency
         print(f"[agent] planner... {focus_prefix}")
+        if prior_state:
+            context_pack = dict(prior_state)
+            # Refresh file list so patch planner sees current reality
+            context_pack["files_top"] = _bounded_list(list_tree(cfg.root), 250)
+            plan_msgs = _planner_prompt_patch(subtask, context_pack)
+        else:
+            plan_msgs = _planner_prompt_fresh(subtask)
+
         plan_raw = ollama_chat(
             cfg.base_url,
             cfg.planner_model,
-            _planner_prompt(subtask),
+            plan_msgs,
             temperature=0.2,
             timeout_s=cfg.timeout_s,
             retries=cfg.retries,
@@ -329,52 +451,25 @@ def run_agent(
         _save_text(run_dir, f"1_planner_raw_sub{sub_i}.txt", plan_raw)
 
         plan_json = _extract_json_obj(plan_raw) or {"acceptance": [], "plan": []}
-        (run_dir / f"1_plan_sub{sub_i}.json").write_text(
-            json.dumps(plan_json, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        _log_event(
-            run_dir,
-            {
-                "type": "plan",
-                "sub": sub_i,
-                "plan": plan_json.get("plan", []),
-                "acceptance": plan_json.get("acceptance", []),
-            },
-        )
+        (run_dir / f"1_plan_sub{sub_i}.json").write_text(json.dumps(plan_json, indent=2, ensure_ascii=False), encoding="utf-8")
+        _log_event(run_dir, {"type": "plan", "sub": sub_i, "plan": plan_json.get("plan", []), "acceptance": plan_json.get("acceptance", [])})
 
-        # NEW: cache plan steps for step-level progress events
-        plan_steps = _safe_plan_steps(plan_json)
-        _log_event(
-            run_dir,
-            {
-                "type": "plan_steps_meta",
-                "sub": sub_i,
-                "count": len(plan_steps),
-            },
+        # Immediately write/update state after planning (so next run starts bounded)
+        state_after_plan = _build_context_pack(
+            cfg.root,
+            cfg.task,
+            plan_json=plan_json,
+            verifier_report=None,
+            changes=None,
+            run_dir=run_dir,
         )
+        _write_state(cfg.root, state_after_plan)
 
         last_progress = _now()
         last_verifier_report: Dict[str, Any] = {}
-        completed_steps: set[int] = set()
+        last_changes: List[dict] = []
 
         for it in range(1, cfg.max_iters + 1):
-            # NEW: plan-step start event
-            step_num = _map_iter_to_step(plan_steps, it)
-            meta = _step_meta(plan_steps, step_num)
-            _log_event(
-                run_dir,
-                {
-                    "type": "plan_step_start",
-                    "sub": sub_i,
-                    "iter": it,
-                    "step": step_num,
-                    "title": meta.get("title"),
-                    "details": meta.get("details"),
-                    "files_likely": meta.get("files_likely"),
-                },
-            )
-
             _log_event(run_dir, {"type": "iter_start", "iter": it, "sub": sub_i})
             print(f"[agent] Iteration {it}/{cfg.max_iters} {focus_prefix}")
 
@@ -439,54 +534,31 @@ def run_agent(
                 _log_event(run_dir, {"type": "verify_llm", "iter": it, "sub": sub_i, "pass": ok_llm, "issues": llm_issues, "suggestions": llm_suggestions})
 
             if ok_inv and plugin_pass and (ok_llm if cfg.llm_verifier else True):
-                # NEW: if we pass, mark ALL remaining steps as done (so checklist finishes cleanly)
-                nsteps = len(plan_steps)
-                if nsteps > 0:
-                    for s in range(1, nsteps + 1):
-                        if s in completed_steps:
-                            continue
-                        m = _step_meta(plan_steps, s)
-                        _log_event(
-                            run_dir,
-                            {
-                                "type": "plan_step_done",
-                                "sub": sub_i,
-                                "iter": it,
-                                "step": s,
-                                "title": m.get("title"),
-                                "reason": "verified_pass",
-                            },
-                        )
-                        completed_steps.add(s)
-                else:
-                    # No plan steps; still close out the current step
-                    if step_num not in completed_steps:
-                        _log_event(
-                            run_dir,
-                            {
-                                "type": "plan_step_done",
-                                "sub": sub_i,
-                                "iter": it,
-                                "step": step_num,
-                                "title": meta.get("title"),
-                                "reason": "verified_pass",
-                            },
-                        )
-                        completed_steps.add(step_num)
-
+                verifier_report = {
+                    "invariants": {"pass": ok_inv, "issues": issues_inv},
+                    "plugins": {"pass": plugin_pass, "issues": plugin_issues},
+                    "llm": vobj if cfg.llm_verifier else {"pass": True, "issues": [], "suggestions": []},
+                }
                 _log_event(
                     run_dir,
                     {
                         "type": "summary",
                         "verified_pass": True,
                         "sub": sub_i,
-                        "verifier_report": {
-                            "invariants": {"pass": ok_inv, "issues": issues_inv},
-                            "plugins": {"pass": plugin_pass, "issues": plugin_issues},
-                            "llm": vobj if cfg.llm_verifier else {"pass": True, "issues": [], "suggestions": []},
-                        },
+                        "verifier_report": verifier_report,
                     },
                 )
+                # Update state on success too
+                final_state = _build_context_pack(
+                    cfg.root,
+                    cfg.task,
+                    plan_json=plan_json,
+                    verifier_report=verifier_report,
+                    changes=last_changes,
+                    run_dir=run_dir,
+                )
+                _write_state(cfg.root, final_state)
+
                 print("[agent] done. verified_pass=True")
                 break
 
@@ -495,6 +567,17 @@ def run_agent(
                 "plugins": {"pass": plugin_pass, "issues": plugin_issues, "enabled": list(cfg.verify_plugins or [])},
                 "llm": vobj if cfg.llm_verifier else {"pass": True, "issues": [], "suggestions": []},
             }
+
+            # Update state snapshot every iteration (bounded)
+            iter_state = _build_context_pack(
+                cfg.root,
+                cfg.task,
+                plan_json=plan_json,
+                verifier_report=last_verifier_report,
+                changes=last_changes,
+                run_dir=run_dir,
+            )
+            _write_state(cfg.root, iter_state)
 
             focus_lines: List[str] = []
             if not ok_inv:
@@ -538,23 +621,8 @@ def run_agent(
                         "msg": "Coder returned zero writes. Next iteration should explicitly write required files.",
                     },
                 )
-                # NEW: mark step skipped (keeps checklist honest + visible)
-                if step_num not in completed_steps:
-                    _log_event(
-                        run_dir,
-                        {
-                            "type": "plan_step_skip",
-                            "sub": sub_i,
-                            "iter": it,
-                            "step": step_num,
-                            "title": meta.get("title"),
-                            "reason": "coder_no_writes",
-                        },
-                    )
-                # no changes => do not bump last_progress
-                continue
 
-            changes = []
+            changes: List[dict] = []
             for w in writes:
                 if not isinstance(w, dict):
                     continue
@@ -564,29 +632,27 @@ def run_agent(
                     continue
                 changes.append(write_file(cfg.root, path, content))
 
+            last_changes = changes
+
             _log_event(run_dir, {"type": "tool_results", "iter": it, "sub": sub_i, "changes": changes})
             (run_dir / f"3_tool_results_sub{sub_i}_iter{it}.json").write_text(
                 json.dumps({"changes": changes}, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
 
+            # Update state after writes too (helps next run immediately)
+            post_write_state = _build_context_pack(
+                cfg.root,
+                cfg.task,
+                plan_json=plan_json,
+                verifier_report=last_verifier_report,
+                changes=last_changes,
+                run_dir=run_dir,
+            )
+            _write_state(cfg.root, post_write_state)
+
             if changes:
                 last_progress = _now()
-                # NEW: mark current step done after successful writes
-                if step_num not in completed_steps:
-                    _log_event(
-                        run_dir,
-                        {
-                            "type": "plan_step_done",
-                            "sub": sub_i,
-                            "iter": it,
-                            "step": step_num,
-                            "title": meta.get("title"),
-                            "reason": "writes_applied",
-                            "writes": len(changes),
-                        },
-                    )
-                    completed_steps.add(step_num)
 
         else:
             _log_event(
@@ -602,6 +668,18 @@ def run_agent(
                     },
                 },
             )
+
+            # Write state even on failure (for patch planning next run)
+            fail_state = _build_context_pack(
+                cfg.root,
+                cfg.task,
+                plan_json=plan_json,
+                verifier_report=last_verifier_report,
+                changes=last_changes,
+                run_dir=run_dir,
+            )
+            _write_state(cfg.root, fail_state)
+
             print("[agent] done. verified_pass=False (max iters)")
             return 1
 

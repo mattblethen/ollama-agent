@@ -22,7 +22,6 @@
     }
     header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
 
-    /* 3-panel layout now */
     main {
       display: grid;
       grid-template-columns: 420px 420px 1fr;
@@ -89,7 +88,6 @@
 
     a { color: #8bd5ff; text-decoration: none; }
 
-    /* Plan UI */
     .h2 {
       font-size: 12px;
       margin: 0 0 10px;
@@ -115,6 +113,8 @@
       opacity: 0.9;
       margin-left: 8px;
     }
+
+    /* Checklist states */
     .checkRow {
       display: flex;
       gap: 10px;
@@ -124,14 +124,16 @@
       border: 1px solid #1c2a3a;
       background: #0d141c;
       margin-bottom: 8px;
+      transition: border-color 120ms ease, background 120ms ease;
     }
     .checkRow.done { border-color: #2c4a33; background: #0e1711; }
+    .checkRow.active { border-color: #3b556f; background: #0c1520; }
+    .checkRow.skipped { border-color: #6a5a2b; background: #17130a; }
     .checkRow input[type="checkbox"] { width: auto; margin-top: 3px; }
     .stepTitle { font-weight: 700; font-size: 12px; }
     .stepDetails { font-size: 12px; margin-top: 2px; opacity: 0.85; }
     .filesLikely { font-size: 11px; margin-top: 6px; opacity: 0.75; }
 
-    /* Stream split */
     .streamGrid {
       display: grid;
       grid-template-rows: auto auto 1fr;
@@ -289,7 +291,7 @@
       <div class="h2">Checklist</div>
       <div id="planSteps"></div>
       <div class="small muted" id="planHint" style="margin-top:8px;">
-        Auto-check completes when the run verifies pass. We’ll wire step-by-step auto-checking once the server emits richer progress markers.
+        Steps auto-mark as <b>active</b> on <code>plan_step_start</code>, <b>done</b> on <code>plan_step_done</code>, and <b>skipped</b> if the coder emits no writes.
       </div>
     </div>
   </section>
@@ -317,7 +319,7 @@
           </div>
           <div class="paneBody" id="llmFeed">
             <div class="paneBodyInner small muted" id="llmHint">
-              Waiting for server to stream raw model outputs. Next step is updating <code>ui_server.py</code> to emit planner/coder/verifier responses as they’re written in the run_dir.
+              This panel fills when the server emits <code>t="llm"</code> messages (planner/coder/verifier raw outputs).
             </div>
           </div>
         </div>
@@ -325,7 +327,7 @@
 
       <div class="card">
         <div class="small muted">
-          Tip: once server support is added, you’ll see every raw model response here, plus the plan auto-check will update step-by-step.
+          Tip: if the run verifies pass early, the UI will also mark remaining checklist steps done to match the verified state.
         </div>
       </div>
     </div>
@@ -347,7 +349,6 @@
     el.className = "logline " + cls;
     el.textContent = text;
     $("log").appendChild(el);
-    // autoscroll
     $("log").parentElement.scrollTop = $("log").parentElement.scrollHeight;
   }
 
@@ -357,7 +358,7 @@
     const hint = document.createElement("div");
     hint.className = "paneBodyInner small muted";
     hint.id = "llmHint";
-    hint.textContent = "Waiting for server to stream raw model outputs. Next step is updating ui_server.py to emit planner/coder/verifier responses as they’re written in the run_dir.";
+    hint.textContent = 'This panel fills when the server emits t="llm" messages (planner/coder/verifier raw outputs).';
     $("llmFeed").appendChild(hint);
   }
 
@@ -373,13 +374,6 @@
 
   // PLAN rendering
   let currentPlan = null; // {acceptance:[], plan:[]}
-  function renderAcceptance(acc) {
-    if (!acc || !acc.length) {
-      $("acceptanceList").textContent = "(none)";
-      return;
-    }
-    $("acceptanceList").innerHTML = acc.map(a => `<div>• ${escapeHtml(a)}</div>`).join("");
-  }
 
   function escapeHtml(s) {
     return String(s)
@@ -388,6 +382,14 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  function renderAcceptance(acc) {
+    if (!acc || !acc.length) {
+      $("acceptanceList").textContent = "(none)";
+      return;
+    }
+    $("acceptanceList").innerHTML = acc.map(a => `<div>• ${escapeHtml(a)}</div>`).join("");
   }
 
   function renderPlanSteps(planArr) {
@@ -412,7 +414,12 @@
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.addEventListener("change", () => {
+        // manual override still allowed
         row.classList.toggle("done", cb.checked);
+        if (cb.checked) {
+          row.classList.remove("active");
+          row.classList.remove("skipped");
+        }
       });
 
       const body = document.createElement("div");
@@ -440,20 +447,49 @@
     }
   }
 
+  function getStepRow(stepNum) {
+    return document.querySelector(`.checkRow[data-step="${CSS.escape(String(stepNum))}"]`);
+  }
+
+  function setStepState(stepNum, state) {
+    // state: "active" | "done" | "skipped" | "clear"
+    const row = getStepRow(stepNum);
+    if (!row) return;
+
+    const cb = row.querySelector('input[type="checkbox"]');
+
+    // reset visual flags
+    row.classList.remove("active");
+    row.classList.remove("done");
+    row.classList.remove("skipped");
+
+    if (state === "active") {
+      row.classList.add("active");
+      if (cb) cb.checked = false;
+    } else if (state === "done") {
+      row.classList.add("done");
+      if (cb) cb.checked = true;
+    } else if (state === "skipped") {
+      row.classList.add("skipped");
+      if (cb) cb.checked = false;
+    } else {
+      if (cb) cb.checked = false;
+    }
+  }
+
   function checkAllPlanSteps() {
     const rows = Array.from(document.querySelectorAll(".checkRow"));
     for (const r of rows) {
       const cb = r.querySelector('input[type="checkbox"]');
-      if (cb) {
-        cb.checked = true;
-        r.classList.add("done");
-      }
+      if (cb) cb.checked = true;
+      r.classList.remove("active");
+      r.classList.remove("skipped");
+      r.classList.add("done");
     }
   }
 
-  // LLM feed blocks (server will emit these later)
+  // LLM feed blocks
   function appendLLM(kind, payload) {
-    // payload could be {model, sub, iter, text} or similar
     const wrap = document.createElement("div");
     wrap.className = "llmBlock";
 
@@ -480,7 +516,6 @@
     wrap.appendChild(hdr);
     wrap.appendChild(body);
 
-    // remove hint if present
     const hint = $("llmHint");
     if (hint) hint.remove();
 
@@ -583,7 +618,6 @@
       } else if (t === "event") {
         const typ = d.type || "event";
 
-        // Plan comes through here (events.jsonl)
         if (typ === "plan") {
           const plan = Array.isArray(d.plan) ? d.plan : [];
           const acc = Array.isArray(d.acceptance) ? d.acceptance : [];
@@ -592,38 +626,67 @@
           renderAcceptance(acc);
           renderPlanSteps(plan);
           logLine(`[event] plan (${plan.length} step(s))`, "dim");
+
         } else if (typ === "iter_start") {
-          // We don’t know total subtasks from events alone; show what we can.
           const it = d.iter ?? null;
           const sub = d.sub ?? null;
           setProgress(sub, "?", it, $("maxIters").value || "?");
           logLine(`[event] iter_start (sub=${sub}, iter=${it})`, "dim");
+
+        } else if (typ === "plan_step_start") {
+          const step = d.step;
+          if (step != null) {
+            // only set active if not already done
+            const row = getStepRow(step);
+            if (row && !row.classList.contains("done")) setStepState(step, "active");
+          }
+          logLine(`[event] plan_step_start (step=${d.step}, iter=${d.iter})`, "dim");
+
+        } else if (typ === "plan_step_done") {
+          const step = d.step;
+          if (step != null) setStepState(step, "done");
+          logLine(`[event] plan_step_done (step=${d.step}, iter=${d.iter})`, "ok");
+
+        } else if (typ === "plan_step_skip") {
+          const step = d.step;
+          if (step != null) {
+            const row = getStepRow(step);
+            if (row && !row.classList.contains("done")) setStepState(step, "skipped");
+          }
+          logLine(`[event] plan_step_skip (step=${d.step}, iter=${d.iter})`, "dim");
+
         } else if (typ === "summary") {
           const ok = d.verified_pass === true;
           logLine(`[summary] verified_pass=${ok}`, ok ? "ok" : "err");
           if (ok) checkAllPlanSteps();
+
         } else if (typ === "verify_llm") {
           const ok = !!d.pass;
           logLine(`[event] verify_llm pass=${ok}`, ok ? "ok" : "err");
+
         } else if (typ === "verify_local") {
           const ok = !!d.pass;
           const name = d.name || "local";
           logLine(`[event] verify_local(${name}) pass=${ok}`, ok ? "ok" : "err");
+
         } else {
           logLine(`[event] ${typ}`, "dim");
         }
+
       } else if (t === "llm") {
-        // NEXT SERVER UPDATE will emit this:
-        // { kind: "planner_raw"|"coder_raw"|"verifier_raw", model, sub, iter, text }
         appendLLM(d.kind || "llm", d);
+
       } else if (t === "event_raw") {
         logLine(`[event_raw] ${d}`, "dim");
+
       } else if (t === "error") {
         logLine(`[error] ${JSON.stringify(d)}`, "err");
+
       } else if (t === "done") {
         logLine(`[done] exit_code=${d.exit_code}`, d.exit_code === 0 ? "ok" : "err");
         setStatus("idle");
         es.close();
+
       } else {
         logLine(`[${t}] ${JSON.stringify(d)}`, "dim");
       }
